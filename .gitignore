@@ -1,0 +1,11 @@
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+
+# Packaging output (future: zip built for ESOUI/Bethesda upload)
+/dist/
+*.zip

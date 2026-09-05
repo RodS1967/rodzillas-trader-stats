@@ -1,0 +1,10 @@
+## Title: RodZilla's Trader Stats
+## Author: RodZilla
+## Version: 0.1.0
+## AddonVersion: 1
+## APIVersion: 101050
+## Description: Focused guild trader sales history and statistics. No bloat, just your numbers.
+## SavedVariables: RodZillaTraderStats_SavedVars
+## DependsOn: LibHistoire
+
+RodZillaTraderStats.lua

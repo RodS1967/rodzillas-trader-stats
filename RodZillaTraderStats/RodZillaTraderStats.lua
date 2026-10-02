@@ -11,7 +11,22 @@ local RZTS = RodZillaTraderStats
 function RZTS.InitializeSavedVars()
     RZTS.savedVars = ZO_SavedVars:NewAccountWide("RodZillaTraderStats_SavedVars", 1, nil, {
         itemStats = {},
+        selectedGuildId = nil,
     })
+end
+
+-- Builds the current character's guild list (name + id pairs) for the guild
+-- picker. ESO caps a character at 5 guilds, so this table is always tiny --
+-- not a memory concern regardless of how it's built. Called once from
+-- RegisterAddonMenu rather than on every dropdown interaction.
+function RZTS.BuildGuildList()
+    local names, ids = {}, {}
+    for i = 1, GetNumGuilds() do
+        local guildId = GetGuildId(i)
+        names[i] = GetGuildName(guildId)
+        ids[i] = guildId
+    end
+    return names, ids
 end
 
 -- TODO: LibHistoire integration.
@@ -48,20 +63,36 @@ end
 -- native ESO menu, not something we built) with a button to open our actual window, plus
 -- a "/rzts" shortcut straight to that settings page.
 function RZTS.RegisterAddonMenu()
-    local LAM = LibStub("LibAddonMenu-2.0")
+    -- LibAddonMenu2 global, not LibStub -- LibStub is deprecated/obsolete since the
+    -- Summerset chapter (ESO's own add-on versioning made it redundant); confirmed
+    -- 2026-10-02 against LibAddonMenu's own ESOUI page.
+    local LAM = LibAddonMenu2
 
     local panelData = {
         type = "panel",
         name = "RodZilla's Trader Stats",
         displayName = "RodZilla's Trader Stats",
-        author = RZTS.name,
+        author = "Team RodZilla LLC",
         version = RZTS.version,
         slashCommand = "/rzts",
         registerForRefresh = true,
     }
 
+    local guildNames, guildIds = RZTS.BuildGuildList()
+
     local optionsTable = {
         [1] = {
+            type = "dropdown",
+            name = "Guild",
+            tooltip = "Choose which guild's trader history to track.",
+            choices = guildNames,
+            choicesValues = guildIds,
+            getFunc = function() return RZTS.savedVars.selectedGuildId end,
+            setFunc = function(value) RZTS.savedVars.selectedGuildId = value end,
+            width = "full",
+            warning = (#guildNames == 0) and "You are not in any guilds." or nil,
+        },
+        [2] = {
             type = "button",
             name = "Open Stats Window",
             tooltip = "Opens the RodZilla's Trader Stats window.",
@@ -74,13 +105,25 @@ function RZTS.RegisterAddonMenu()
     LAM:RegisterOptionControls(RZTS.name, optionsTable)
 end
 
+-- Custom windows don't auto-close on combat by default (confirmed via research) -- only close
+-- our own window if it's actually the one showing, so we don't interfere with anything else.
+function RZTS.OnCombatState(_, inCombat)
+    if inCombat and RZTS.scene:IsShowing() then
+        RZTS.HideWindow()
+    end
+end
+
 function RZTS.OnPlayerActivated()
     EVENT_MANAGER:UnregisterForEvent(RZTS.name, EVENT_PLAYER_ACTIVATED)
 
     -- Deferred to here rather than OnAddOnLoaded: SCENE_MANAGER isn't guaranteed ready yet at
     -- EVENT_ADD_ON_LOADED time, so scene/fragment setup needs to wait until the player is
-    -- actually in the world.
+    -- actually in the world. Same reasoning for RegisterAddonMenu -- it reads the account's
+    -- guild list (GetNumGuilds/GetGuildId/GetGuildName) for the guild-picker dropdown, and
+    -- that's account data, not something to assume is populated this early.
     RZTS.InitializeScene()
+    RZTS.RegisterAddonMenu()
+    EVENT_MANAGER:RegisterForEvent(RZTS.name, EVENT_PLAYER_COMBAT_STATE, RZTS.OnCombatState)
 
     d("|c00FF00RodZilla's Trader Stats|r loaded (v" .. RZTS.version .. "). See Settings -> Add-Ons, or type /rzts.")
 end
@@ -90,7 +133,6 @@ function RZTS.OnAddOnLoaded(_, addonName)
     EVENT_MANAGER:UnregisterForEvent(RZTS.name, EVENT_ADD_ON_LOADED)
 
     RZTS.InitializeSavedVars()
-    RZTS.RegisterAddonMenu()
     EVENT_MANAGER:RegisterForEvent(RZTS.name, EVENT_PLAYER_ACTIVATED, RZTS.OnPlayerActivated)
 end
 

@@ -2,7 +2,7 @@
     <Controls>
         <TopLevelControl name="RodZillaTraderStatsWindow" hidden="true" mouseEnabled="true"
             clampedToScreen="true">
-            <Dimensions x="400" y="300" />
+            <Dimensions x="760" y="500" />
             <Anchor point="CENTER" />
             <Controls>
                 <Backdrop name="$(parent)Bg" integralWrapping="true">

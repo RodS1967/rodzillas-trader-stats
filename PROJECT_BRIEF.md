@@ -19,7 +19,76 @@ A focused ESO add-on that consolidates guild trader sales history into a clean s
   - No screenshot / base-game-settings API access on console (not relevant to this add-on).
   - Console add-ons are submitted/tested via ZOS's official Add-On Uploader tool, distributed through Bethesda.net rather than ESOUI — no manual file-drop test loop like PC.
 - **Guild History API is rate-limited by the game itself, not addon-specific:** ~1 page per minute per guild. Any add-on reading guild trader sales history hits this; it's why initial history loads take a long time for active guilds. Design around it (background/resumable loading), don't fight it.
-- **LibHistoire** (by sirinsidiator, license **Artistic-2.0** — confirmed, permissive, fine for a free add-on) is the community-standard caching layer built specifically to solve the rate-limit/server-destabilization problem. Declared as a manifest dependency (not bundled) — standard practice so multiple add-ons sharing it don't duplicate/conflict. **LibHistoire's exact event-registration API still needs to be pulled and verified before wiring up `RZTS.RecordSale` — do not guess at function signatures.**
+- **LibHistoire** (by sirinsidiator, license **Artistic-2.0** — confirmed, permissive, fine for a free add-on) is the community-standard caching layer built specifically to solve the rate-limit/server-destabilization problem. Declared as a manifest dependency (not bundled) — standard practice so multiple add-ons sharing it don't duplicate/conflict. Exact API now verified (see **LibHistoire Trader Data** section below).
+
+## Weekly Trader Table (developer decisions, 2026-10-05)
+
+- **Layout:** one row per weekly hire period, newest first. Columns: Date Range (MM/DD-MM/DD), Kiosk, Sales, Sales Total (###,###,###g), Tax Total (###,###,###g).
+- **Date range:** Tuesday 19:00 UTC to the next Tuesday 19:00 UTC.
+- **Kiosk:** blank for any week where the kiosk is unknown. Sales records don't name the trader, so only the current week's kiosk can be filled, from `GetGuildOwnedKioskInfo`. (Proposed, not yet confirmed: fill the current week only.)
+- **Depth:** show as many weeks as the cached history covers. Design for more than four, but expect about four. Memory is not a concern, since each week is only a few totals.
+- **Sales count:** transactions only. Stack quantities are dropped.
+- **Display:** the results window, not the settings panel, since the panel can't do aligned columns.
+
+## Design Decisions (developer, 2026-10-05)
+
+- **On-demand loading:** statistics are loaded when a guild is chosen, not kept running in the background.
+- **Single-guild state:** when the guild changes, previous statistics are cleared and overwritten for the new guild. Only one guild's stats are held at a time. This also follows the minimal-memory constraint.
+- **Target user is a guild master or the officer who hires traders.** Regular members get whatever subset of information their permissions allow. Missing access is expected: the add-on should work with what's available and not fail when something is hidden.
+- **More information allows finer breakdowns.** Design every view so it degrades gracefully: sales-only if hiring history isn't accessible, and so on.
+
+**Implementation implications (not yet built):**
+- Changing guild must stop the previous guild's LibHistoire processors and clear their callbacks, so a late callback can't write into the new guild's stats.
+- LibHistoire keeps its own cache in its SavedVariables, which is outside our footprint. Our part is the aggregated stats only.
+
+## Permission Test Results (2026-10-05)
+
+- Test button (LAM, "Test: Trader Hirings (chat)") streams the BANKED_CURRENCY category for the selected guild and reports kiosk purchases.
+- Result: started, then stopped with **0 events scanned**, 0 hirings.
+- Trader sales test: **0 events**, while the in-game guild history UI shows about 4 days of trader history. The developer joined the guild 4 days ago, which may explain the 4 days. So access to the data is not the problem. LibHistoire's own cache is empty or not yet filled.
+- Why the test returned 0: `SetStopOnLastCachedEvent(true)` stops as soon as the cache runs out. With an empty cache, that's immediately, before LibHistoire has fetched anything. The test stopped too early.
+- Next step: wait for LibHistoire to establish the managed range (`Callbacks.MANAGED_RANGE_FOUND`, which passes guildId and category) or watch `GetPendingEventMetrics()`, then stream. Verify that the cache fills for the guild before drawing conclusions about banked-currency access.
+- Fix found along the way: processors default to listening for future events and never stop. Needed `SetStopOnLastCachedEvent(true)` before `StartStreaming`.
+
+- **Result (2026-10-05, after the progress-reporting fix):** trader sales are visible through LibHistoire: **over 6,000 sales** scanned. Access was never the problem; the earlier zero came from LibHistoire's cache not being filled yet.
+- **Resolved (2026-10-05):** the date span confirms about 4 days of sales, matching the developer's membership start. So the visible window appears to start at membership, not at the guild's full retention. Retention depth is still unknown: a long-standing member would show more, and that's the test to run later. Volume is high: over 6,000 sales in about 4 days.
+
+- **Hiring history: zero is expected for this developer, not proof of no access.** Traders are hired weekly (Tuesdays, 19:00 UTC), and the developer joined after the last hire, so the 4-day window contains no hirings. Verification: re-run the banked-currency scan after the Tuesday 2026-10-06 19:00 UTC hire. A kiosk purchase with that timestamp would confirm access.
+- **Design implication:** hirings are rare, so a single scan will often find none. Hiring history has to be recorded as it happens, or collected over the window the player can see. Members who joined after a hire will never see it.
+
+## LibHistoire Trader Data (verified 2026-10-05)
+
+Sources: LibHistoire's own `doc/api_reference.txt` (master branch), and ESO base-game `esoui/ingame/guildhistory/guildhistory_data.lua` (esoui/esoui master) — the latter is the authoritative field list for trader events.
+
+**Access pattern:**
+- `LibHistoire:CreateGuildHistoryProcessor(guildId, GUILD_HISTORY_EVENT_CATEGORY_TRADER, addonName)` → processor. One processor per guild per category.
+- Use `processor:StartStreaming(lastProcessedId, eventCallback)` (or `SetNextEventCallback` + `Start`). Events arrive asynchronously, in eventId order.
+- Resume support is built in: `lastProcessedId` / `SetAfterEventId`, plus `processor:GetKey()` (server + guild + category) for storing a resume point. This fits the rate-limited, resumable loading design above.
+- Wait for `LibHistoire:OnReady(callback)` or `IsReady()` before calling anything.
+- Callback event objects **must not be stored** (per the API doc) — aggregate on arrival. Fits the minimal-memory constraint.
+
+**Fields per trader event** (from `ZO_GuildHistoryTraderEventData`, backed by `GetGuildHistoryTraderEventInfo(guildId, eventIndex)`):
+- `eventId` — stable, sortable ID (resume point)
+- `timestampS` — seconds
+- `isRedacted` — boolean; redacted events exist but their details are hidden
+- `eventType` — what kind of trader event (sale vs. other). **Enum values not yet verified** — needed to filter to actual sales.
+- `sellerDisplayName`, `buyerDisplayName`
+- `itemLink` — full item link (identity, name, quality)
+- `quantity`
+- `price` — total gold for the transaction
+- `tax` — gold tax taken
+
+**Derived, not given:** per-unit price = `price / quantity`. Use per-unit for min/max/avg so different stack sizes compare fairly — a design decision to confirm.
+
+**Still unknown / to verify before building:**
+- `eventType` enum values (which mean "item sold")
+- What `isRedacted` hides, and whether redacted events count toward stats
+- How far back guild trader history is retained. Not in either primary source. A secondary search summary cited ~30 days; developer recalls 2–3 weeks, possibly 28 days (same as bank history). **Treat as unverified** — confirm in-game (guild history panel) or from a primary source before relying on it.
+- **Current trader — available, but only as a snapshot.** `GetGuildOwnedKioskInfo(guildId)` returns the name of the guild's currently hired trader, or nil if none (verified from ESO base-game `guildhome_keyboard.lua`, `RefreshTraderOwnership`). It shows what's there now, not what was there at a past sale time, and it's not verified whether the name includes a location. To attribute past sales to a trader, the add-on would have to record the trader name over time itself (e.g. on login and when it changes) and match sales by timestamp. Attribution would only go forward from when tracking started.
+- **Trader hiring history — available, via the BANKED_CURRENCY category (verified 2026-10-05).** LibHistoire's `compatibility.lua` maps `GUILD_HISTORY_BANKED_CURRENCY_EVENT_KIOSK_PURCHASED`, `..._KIOSK_BID`, and `..._KIOSK_BID_REFUND` to events carrying `displayName` (who acted), `amount`, and `kioskName`. The base game's banked-currency event fields (`guildhistory_data.lua`) include `kioskName`. So a kiosk purchase (hiring a trader) records the trader's name, the buyer, the cost, and a timestamp. Also `GUILD_EVENT_GUILD_KIOSK_PURCHASE_REFUND` exists. **Not yet verified:** that `kioskName` matches the string `GetGuildOwnedKioskInfo` returns; whether a trader being removed or replaced appears as an event; and what the kiosk-lock/unlock milestone events mean for this.
+- **Trader sale event type resolved:** the TRADER category's only supported event type is `GUILD_HISTORY_TRADER_EVENT_ITEM_SOLD` (LibHistoire `compatibility.lua`). The category is sales-only.
+- **Which trader (location) made a sale — not visible in history.** The trader event has no location/kiosk field. Only `kioskName` exists, and only on banked-currency events, not trader events. The sale record identifies seller and buyer players, not the physical guild trader. So if traders move week to week, sales can't be attributed to a location from this data. Seller/buyer player names are the only identity available.
+- **Design question for the developer:** the picker currently stores one guild ID, but the developer is in two guilds. Track one guild or both?
 - **Data/memory strategy:** store aggregated per-item statistics only (count, gold total, min/max/avg price, last N sale timestamps) — not a permanent raw event log. Keeps footprint small regardless of guild sales volume, important given the console memory/size constraints above. Exact retention depth (how many recent sales to keep in detail) to be tuned once real data volume is observed.
 - **Current APIVersion (as of 2026-09-04):** `101050` (live, patch "2026 Season 0 - Part 2"). Note: PTS is already on `101051` for a patch expected live **2026-09-28** — the manifest's `## APIVersion` will need updating around then to keep the add-on loading on live servers.
 - **ESO base game is not free-to-play** — $19.99 on Steam, frequently on sale (as low as ~$5, historic low $1.99). Needed on PC for the dev/test loop.

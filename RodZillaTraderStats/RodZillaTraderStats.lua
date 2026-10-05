@@ -171,8 +171,24 @@ end
 -- check the base game uses. A processor reaching the end of what's cached is not enough:
 -- a guild that hasn't been fetched yet has an empty cache, which looks identical to a
 -- finished one.
+-- A guild with no trader sales never has gapless events to report, so LibHistoire's
+-- CATEGORY_LINKED callback is the only "nothing left to fetch" signal. It fires once per
+-- session per category, so it's recorded as it happens.
+RZTS.linkedTraderGuilds = {}
+
+function RZTS.RegisterLinkedCallback()
+    LibHistoire:OnReady(function(lib)
+        lib:RegisterCallback(lib.callback.CATEGORY_LINKED, function(guildId, category)
+            if category == GUILD_HISTORY_EVENT_CATEGORY_TRADER then
+                RZTS.linkedTraderGuilds[guildId] = true
+            end
+        end)
+    end)
+end
+
 local function IsTraderHistoryUpToDate(guildId)
-    return GetOldestGuildHistoryEventIndexForUpToDateEventsWithoutGaps(guildId, GUILD_HISTORY_EVENT_CATEGORY_TRADER) ~= nil
+    return RZTS.linkedTraderGuilds[guildId] == true
+        or GetOldestGuildHistoryEventIndexForUpToDateEventsWithoutGaps(guildId, GUILD_HISTORY_EVENT_CATEGORY_TRADER) ~= nil
 end
 
 function RZTS.ComputeTraderStats()
@@ -375,6 +391,7 @@ function RZTS.OnPlayerActivated()
     -- that's account data, not something to assume is populated this early.
     RZTS.InitializeScene()
     RZTS.RegisterAddonMenu()
+    RZTS.RegisterLinkedCallback()
     EVENT_MANAGER:RegisterForEvent(RZTS.name, EVENT_PLAYER_COMBAT_STATE, RZTS.OnCombatState)
 
     d("|c00FF00RodZilla's Trader Stats|r loaded (v" .. RZTS.version .. "). See Settings -> Add-Ons, or type /rzts.")

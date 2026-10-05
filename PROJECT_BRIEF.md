@@ -41,6 +41,12 @@ A focused ESO add-on that consolidates guild trader sales history into a clean s
 - Changing guild must stop the previous guild's LibHistoire processors and clear their callbacks, so a late callback can't write into the new guild's stats.
 - LibHistoire keeps its own cache in its SavedVariables, which is outside our footprint. Our part is the aggregated stats only.
 
+## TODO: Empty-Guild Test
+
+- Empty-guild handling is implemented but untested. A guild with no trader history should show "up to date" with zero sales, based on LibHistoire's `CATEGORY_LINKED` callback, which the add-on records per session.
+- To test: create a solo guild (developer alone, no trader history) and select it in the picker.
+- Known limitation: `CATEGORY_LINKED` fires once per session per category. If a guild was already linked before the add-on loaded, it won't fire again this session. Empty guilds may show "fetching" until the next login.
+
 ## Permission Test Results (2026-10-05)
 
 - Test button (LAM, "Test: Trader Hirings (chat)") streams the BANKED_CURRENCY category for the selected guild and reports kiosk purchases.

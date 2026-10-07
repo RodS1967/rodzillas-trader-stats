@@ -7,5 +7,4 @@
 ## SavedVariables: RodZillaTraderStats_SavedVars
 ## DependsOn: LibHistoire LibAddonMenu-2.0
 
-RodZillaTraderStats.xml
 RodZillaTraderStats.lua

@@ -384,12 +384,38 @@ function RZTS.ComputeTraderStats()
     WaitUntilReady()
 end
 
+-- LAM's "full width" widget layout always draws the `name` as a label on the left and
+-- anchors the actual control to the right -- see CreateLabelAndContainerControl in
+-- LibAddonMenu-2.0.lua -- there's no widgetData option to change that. This runs once,
+-- right after the dropdown is guaranteed to exist: it's optionsTable[1], created before
+-- the "custom" table widget ([3]) whose createFunc calls this, in the same synchronous
+-- pass -- see LAM's CreateWidgetsInPanel, which creates widgets in index order.
+function RZTS.RepositionGuildDropdown()
+    local dropdownControl = RodZillaTraderStatsGuildDropdown
+    if not dropdownControl or RZTS.guildDropdownRepositioned then return end
+    RZTS.guildDropdownRepositioned = true
+
+    dropdownControl.label:SetText("")
+    dropdownControl.container:ClearAnchors()
+    dropdownControl.container:SetAnchor(TOPLEFT, dropdownControl, TOPLEFT, 0, 0)
+end
+
 -- LibAddonMenu-2.0 registration: gives us a "RodZilla's Trader Stats" entry under
--- Settings -> Add-Ons (works in both keyboard/mouse and gamepad UI, since that's an existing
--- native ESO menu, not something we built), with the weekly table drawn directly on the page
--- via a "custom" LAM widget -- see controls/custom.lua in LibAddonMenu-2.0 -- rather than a
--- separate window. That way switching the guild dropdown just redraws the table in place;
--- there's nothing to open or close. Plus a "/rzts" shortcut straight to the page.
+-- Settings -> Add-Ons, with the weekly table drawn directly on the page via a "custom" LAM
+-- widget -- see controls/custom.lua in LibAddonMenu-2.0 -- rather than a separate window.
+-- That way switching the guild dropdown just redraws the table in place; there's nothing to
+-- open or close. Plus a "/rzts" shortcut straight to the page.
+--
+-- IMPORTANT, confirmed by hand 2026-10-09: this panel is NOT reachable without a keyboard,
+-- even in PC gamepad-preferred mode -- Settings -> Add-Ons itself isn't a gamepad-navigable
+-- screen. (On true console, LAM would hand this off to LibHarvensAddonSettings instead --
+-- see LibAddonMenu-2.0.lua's registerConsoleOptionControls -- but that only fires when
+-- IsKeyboardUISupported() is false, which is never true on the PC client regardless of
+-- input mode or whether that library happens to be installed.) A Bindings.xml keybind was
+-- tried as a gamepad-accessible alternative the same day and abandoned: it was assignable
+-- in Controls -> Keybindings but never actually fired (a "function expected instead of nil"
+-- error from the engine's own dispatcher once placed on an active layer, root cause
+-- unresolved). Gamepad access to guild selection remains an open problem.
 function RZTS.RegisterAddonMenu()
     -- LibAddonMenu2 global, not LibStub -- LibStub is deprecated/obsolete since the
     -- Summerset chapter (ESO's own add-on versioning made it redundant); confirmed
@@ -412,6 +438,9 @@ function RZTS.RegisterAddonMenu()
         [1] = {
             type = "dropdown",
             name = "Guild",
+            -- Global control name -- lets RZTS.RepositionGuildDropdown find this control
+            -- after LAM creates it, to override its stock label/position (see that function).
+            reference = "RodZillaTraderStatsGuildDropdown",
             tooltip = "Choose which guild's trader history to track.",
             choices = guildNames,
             choicesValues = guildIds,
@@ -450,6 +479,7 @@ function RZTS.RegisterAddonMenu()
             maxHeight = STATS_CONTROL_HEIGHT,
             createFunc = function(control)
                 RZTS.statsParent = control
+                RZTS.RepositionGuildDropdown()
                 RZTS.EnsureTableControls(control)
                 RZTS.RenderWeeklyTable()
             end,

@@ -58,6 +58,20 @@ RZTS.panel = nil
 RZTS.tableLabels = nil
 RZTS.statsParent = nil -- the LAM custom control the table is drawn on; set once in its createFunc
 
+-- 2026-10-09: IsKeyboardUISupported() is the real signal LAM itself uses to decide whether to
+-- render a settings panel as its normal keyboard-UI widgets or hand it off (via
+-- registerConsoleOptionControls) to LibHarvensAddonSettings for console -- but it's always
+-- true on the PC client, even in gamepad-preferred mode, so the console branch below can
+-- never actually trigger here. FORCE_CONSOLE_UI_FOR_TESTING exists purely to preview that
+-- branch on PC during development -- flip to true, test, flip back. The warning print in
+-- RegisterAddonMenu below exists so this can't accidentally ship on by mistake. See
+-- memory/eso-console-port-blockers for the full reasoning (no Xbox-only git branch; this
+-- addon forks internally instead, the same way LAM itself does).
+local FORCE_CONSOLE_UI_FOR_TESTING = false
+local function IsConsoleUI()
+    return FORCE_CONSOLE_UI_FOR_TESTING or not IsKeyboardUISupported()
+end
+
 -- Fixed-height block (see STATS_CONTROL_HEIGHT below), embedded directly in the settings
 -- panel via a LAM "custom" widget rather than a separate window -- so switching guilds in
 -- the dropdown just redraws this block in place, with no window to open or close.
@@ -67,7 +81,15 @@ local WEEK_SECONDS = 7 * 86400
 -- needs more than 6 weeks shown, bump this back up (the status line already warns when
 -- rows are being hidden -- see "showing newest N weeks" below -- so it won't go unnoticed).
 local TABLE_MAX_ROWS = 6
-local TABLE_ROW_TOP = 70
+-- 2026-10-09: the top divider moved from a separate LAM widget to one drawn by hand right
+-- inside this canvas (see EnsureTableControls' topDivider), so table rows now need to sit
+-- TOP_DIVIDER_RESERVE lower than canvas y=0 than they used to, to leave room for that divider
+-- and its 10px gap to the guild name above it -- everything below (TABLE_ROWS_BOTTOM,
+-- STATS_CONTROL_HEIGHT, and RenderWeeklyTable's dynamic status/sellers floating) is derived
+-- from TABLE_ROW_TOP, so this shifts the whole block down as one unit instead of needing a
+-- separate adjustment at every layer.
+local TOP_DIVIDER_RESERVE = 20 -- divider line + the 10px gap above the guild name
+local TABLE_ROW_TOP = 70 + TOP_DIVIDER_RESERVE
 local TABLE_ROW_HEIGHT = 24
 local TABLE_ROWS_BOTTOM = TABLE_ROW_TOP + TABLE_MAX_ROWS * TABLE_ROW_HEIGHT
 -- Top sellers: two mini-leaderboards (this week, and everything LibHistoire currently has
@@ -80,17 +102,24 @@ local SELLER_ROW_HEIGHT = 20
 local SELLER_HEADER_HEIGHT = 22
 local SELLER_COLUMN_GAP = 20 -- horizontal gap between the "This Period" and "Overall" columns
 local SELLER_SECTION_HEIGHT = SELLER_HEADER_HEIGHT + TOP_SELLERS_COUNT * SELLER_ROW_HEIGHT
--- Offset from rowsBottom (see RenderWeeklyTable) to where the sellers block starts: past the
--- progress bar's own reserved space (60 + 14, same as the status text's offset below), plus
--- a visual gap.
-local SELLERS_TOP_OFFSET = 60 + 14 + 20
+-- Worst-case offset from rowsBottom (see RenderWeeklyTable) to where the sellers block
+-- starts -- past the status text at its longest (wrapped to 2 lines) and the progress bar
+-- (60 + 14), plus a visual gap. Only used to size STATS_CONTROL_HEIGHT below (the "custom"
+-- widget's height is fixed, so it has to be big enough for the worst case up front) --
+-- RenderWeeklyTable positions the live divider/sellers off the status text's REAL measured
+-- height instead (GetTextHeight()), not this constant, so the common case (status is one
+-- line, no progress bar showing) reclaims the unused space instead of always leaving it
+-- blank. Confirmed in-game 2026-10-09: with the old fixed offset, that gap was there on
+-- every render regardless of actual content, which read as a lot of dead space above/below
+-- the weekly stats compared to the Top Sellers section's own tight internal spacing.
+local SELLERS_TOP_OFFSET_MAX = 60 + 14 + 20
 
 -- Derived from the row count and the sellers block rather than separate fixed numbers, so
 -- this can't drift out of sync with either again: rows end at TABLE_ROWS_BOTTOM, the sellers
--- block starts SELLERS_TOP_OFFSET below that and holds one row's worth of height -- both
--- columns sit side by side and share it -- plus 20px of trailing padding underneath it all.
+-- block starts SELLERS_TOP_OFFSET_MAX below that at worst and holds one row's worth of
+-- height -- both columns sit side by side and share it -- plus 20px of trailing padding.
 local STATS_CONTROL_HEIGHT =
-    TABLE_ROWS_BOTTOM + SELLERS_TOP_OFFSET + SELLER_SECTION_HEIGHT + 20
+    TABLE_ROWS_BOTTOM + SELLERS_TOP_OFFSET_MAX + SELLER_SECTION_HEIGHT + 20
 -- Left/right padding for everything in this block (table columns, status text, progress
 -- bar). The panel's real content width was unknown all day (two guesses, 740 then 710,
 -- were both too wide) until actually measured in-game 2026-10-09: parent:GetWidth() = 585.
@@ -161,6 +190,54 @@ local function TopSellers(sellerTotals, count)
     return top
 end
 
+-- Two possible shapes per bucket/overall: while still scanning, "sellers" is the full live
+-- displayName -> gold table and gets ranked fresh here; once FinalizeSellerStats has run
+-- (scan reached StopReason.LAST_CACHED_EVENT_REACHED), "sellers" is gone and "sellersTop" is
+-- the already-ranked, already-trimmed array -- used directly, not re-ranked, since the full
+-- breakdown behind it no longer exists. Shared by both the PC canvas renderer and the
+-- flattened console options list below -- same data, two different presentations.
+local function ResolveTopSellers(sellersTop, sellersFull)
+    if sellersTop then return sellersTop end
+    return TopSellers(sellersFull or {}, TOP_SELLERS_COUNT)
+end
+
+-- Sorted newest-first, same as the PC table rows. Shared helper so the console options list
+-- (built fresh from scratch) and the PC canvas (RenderWeeklyTable) can't drift apart on sort
+-- order.
+local function GetSortedWeeks()
+    local weeks = {}
+    local s = RZTS.traderStats
+    if s then
+        for _, bucket in pairs(s.buckets) do
+            weeks[#weeks + 1] = bucket
+        end
+    end
+    table.sort(weeks, function(a, b) return a.start > b.start end)
+    return weeks
+end
+
+-- One self-labeled plain-text line per week, for the console options list. Deliberately NOT
+-- a column layout with a separate header row above it (an earlier version tried that) --
+-- confirmed in-game 2026-10-09 that space-padded columns don't align at all in a proportional
+-- font (ZoFontGame), which is all "description" widgets render with. Every value names
+-- itself instead, so the line reads fine with no header needed. " - " separators and the
+-- kiosk name right after the date range (2026-10-09, readability pass): "10/06-10/13:
+-- Kiosk Name - 4401 sales - 116,154,584g sales total - 4,064,070g tax".
+local function FormatWeekLine(bucket)
+    if not bucket then return "" end
+    local rangeEnd = bucket.start + WEEK_SECONDS
+    return string.format("%s-%s: %s - %d sales - %s sales total - %s tax",
+        FormatDate(bucket.start, "!%m/%d"), FormatDate(rangeEnd, "!%m/%d"),
+        bucket.kiosk or "", bucket.sales, FormatGold(bucket.gold), FormatGold(bucket.tax))
+end
+
+-- Same "1. Name: 1,234g" line format used by both the PC canvas (LayoutSellerSection) and the
+-- console options list.
+local function FormatSellerLine(rank, entry)
+    if not entry then return "" end
+    return rank .. ". " .. entry.name .. ": " .. FormatGold(entry.gold)
+end
+
 -- Called once a scan reaches the real end of what LibHistoire has cached (see
 -- SetOnStopCallback, StopReason.LAST_CACHED_EVENT_REACHED) -- replaces each full
 -- displayName -> gold breakdown with just the few entries actually shown (sellersTop,
@@ -209,11 +286,23 @@ function RZTS.EnsureTableControls(parent)
         end
         tableLabels.rows[r] = cells
     end
+    -- Hand-drawn divider (same ZO_Options_Divider template as sellersDivider below), not the
+    -- LAM "divider" widget type used for the one above the Refresh button row -- that type
+    -- can't sit any tighter than LAM's own fixed +15 inter-widget gap on both sides of it
+    -- (confirmed in-game 2026-10-09, measured: divider bottom 398, next widget top 413 -- a
+    -- flat constant inside LibAddonMenu-2.0.lua's CreateAndAnchorWidget, not ours to tune).
+    -- Drawing it ourselves, inside the canvas, means only the top side pays that LAM gap (the
+    -- canvas widget itself still sits 15px below the Refresh button, unavoidably) -- the
+    -- guild name below it can sit as tight as we want, same as sellersDivider/Top Sellers.
+    tableLabels.topDivider = WINDOW_MANAGER:CreateControlFromVirtual(nil, parent, "ZO_Options_Divider")
+    tableLabels.topDivider:SetWidth(TABLE_CONTENT_WIDTH)
+    tableLabels.topDivider:SetAnchor(TOPLEFT, parent, TOPLEFT, TABLE_LEFT_MARGIN, 0)
+
     tableLabels.guild = WINDOW_MANAGER:CreateControl(nil, parent, CT_LABEL)
     tableLabels.guild:SetFont("ZoFontWinH4")
     tableLabels.guild:SetWidth(parent:GetWidth())
     tableLabels.guild:SetHorizontalAlignment(TEXT_ALIGN_CENTER)
-    tableLabels.guild:SetAnchor(TOPLEFT, parent, TOPLEFT, 0, 0)
+    tableLabels.guild:SetAnchor(TOPLEFT, tableLabels.topDivider, BOTTOMLEFT, 0, 10)
     tableLabels.underline = WINDOW_MANAGER:CreateControl(nil, parent, CT_BACKDROP)
     tableLabels.underline:SetCenterColor(0.85, 0.85, 0.85, 0.9)
     tableLabels.underline:SetHeight(2)
@@ -274,14 +363,8 @@ function RZTS.RenderWeeklyTable()
     RZTS.EnsureTableControls(RZTS.statsParent)
     local tableLabels = RZTS.tableLabels
 
-    local weeks = {}
+    local weeks = GetSortedWeeks()
     local s = RZTS.traderStats
-    if s then
-        for _, bucket in pairs(s.buckets) do
-            weeks[#weeks + 1] = bucket
-        end
-    end
-    table.sort(weeks, function(a, b) return a.start > b.start end)
 
     for r = 1, TABLE_MAX_ROWS do
         local cells = tableLabels.rows[r]
@@ -303,7 +386,10 @@ function RZTS.RenderWeeklyTable()
     tableLabels.guild:SetText(RZTS.savedVars.selectedGuildId and GetGuildName(RZTS.savedVars.selectedGuildId) or "No guild selected")
     local textWidth = tableLabels.guild:GetTextWidth()
     tableLabels.underline:SetWidth(textWidth)
-    tableLabels.underline:SetAnchor(TOPLEFT, RZTS.statsParent, TOPLEFT, (RZTS.statsParent:GetWidth() - textWidth) / 2, tableLabels.guild:GetTextHeight() + 2)
+    -- Anchored relative to the guild label itself, not RZTS.statsParent -- guild no longer
+    -- sits at the parent's own TOPLEFT (it's below topDivider now, see EnsureTableControls),
+    -- so anchoring this to the parent would put it in the wrong place.
+    tableLabels.underline:SetAnchor(TOPLEFT, tableLabels.guild, TOPLEFT, (RZTS.statsParent:GetWidth() - textWidth) / 2, tableLabels.guild:GetTextHeight() + 2)
 
     -- Status (and the progress bar below it) float up to sit right after the last row that
     -- actually has data, instead of always sitting below all TABLE_MAX_ROWS slots whether
@@ -313,33 +399,36 @@ function RZTS.RenderWeeklyTable()
     local rowsBottom = TABLE_ROW_TOP + populatedRows * TABLE_ROW_HEIGHT
     tableLabels.status:ClearAnchors()
     tableLabels.status:SetAnchor(TOPLEFT, RZTS.statsParent, TOPLEFT, TABLE_LEFT_MARGIN, rowsBottom + 10)
-    tableLabels.progressTrack:ClearAnchors()
-    tableLabels.progressTrack:SetAnchor(TOPLEFT, RZTS.statsParent, TOPLEFT, TABLE_LEFT_MARGIN, rowsBottom + 60)
-
     tableLabels.status:SetText(s and ("Status: " .. s.status .. (#weeks > TABLE_MAX_ROWS and " (showing newest " .. TABLE_MAX_ROWS .. " weeks)" or "")) or "")
 
-    -- Divider floats with status/progressTrack above -- sits in the middle of the 20px gap
-    -- between the progress bar's reserved space (rowsBottom + 60 + 14) and the top sellers
-    -- section (rowsBottom + SELLERS_TOP_OFFSET), so it reads as "under the weekly stats,
-    -- above the top sellers" without needing any extra reserved height of its own.
-    tableLabels.sellersDivider:ClearAnchors()
-    tableLabels.sellersDivider:SetAnchor(TOPLEFT, RZTS.statsParent, TOPLEFT, TABLE_LEFT_MARGIN, rowsBottom + 84)
+    -- Everything below floats off the status text's REAL measured height now (2026-10-09),
+    -- not a fixed "always assume it wraps to 2 lines" guess -- same GetTextHeight() approach
+    -- already used for the guild-name underline above. The old fixed offset reserved the same
+    -- large gap whether the status message actually wrapped or not, which was most of the
+    -- time ("up to date (N sales)" is one line) -- confirmed in-game as a lot of dead space
+    -- above/below the weekly stats, next to the Top Sellers section's own tight spacing.
+    local statusBottom = rowsBottom + 10 + tableLabels.status:GetTextHeight()
+    local showProgress = s and (s.phase == "loading" or s.phase == "waiting")
 
-    -- Top sellers: floats with status/progressTrack above, past the progress bar's own
-    -- reserved space (SELLERS_TOP_OFFSET), same reasoning -- re-laid-out every render.
-    -- Side by side, not stacked (2026-10-09): current period on the left, overall on the
-    -- right, sharing the same y and split by x (SELLER_COLUMN_WIDTH/SELLER_COLUMN_GAP)
-    -- instead.
-    --
-    -- Two possible shapes per bucket/overall: while still scanning, "sellers" is the full
-    -- live displayName -> gold table and gets ranked fresh here; once FinalizeSellerStats
-    -- has run (scan reached StopReason.LAST_CACHED_EVENT_REACHED), "sellers" is gone and
-    -- "sellersTop" is the already-ranked, already-trimmed array -- used directly, not
-    -- re-ranked, since the full breakdown behind it no longer exists.
-    local function ResolveTopSellers(sellersTop, sellersFull)
-        if sellersTop then return sellersTop end
-        return TopSellers(sellersFull or {}, TOP_SELLERS_COUNT)
-    end
+    tableLabels.progressTrack:ClearAnchors()
+    tableLabels.progressTrack:SetAnchor(TOPLEFT, RZTS.statsParent, TOPLEFT, TABLE_LEFT_MARGIN, statusBottom + 10)
+
+    -- Divider/top sellers sit right after the progress bar's real bottom when it's showing,
+    -- or right after the status text's real bottom when it isn't -- no longer reserving the
+    -- bar's spot unconditionally the way the old fixed SELLERS_TOP_OFFSET did. The panel's
+    -- own fixed height (STATS_CONTROL_HEIGHT, sized off SELLERS_TOP_OFFSET_MAX) still assumes
+    -- the worst case so nothing ever clips -- any space this reclaims just moves to blank
+    -- trailing padding at the bottom of the panel instead of a gap in the middle of it.
+    local afterStatusBlock = statusBottom + (showProgress and (10 + 14 + 20) or 20)
+    tableLabels.sellersDivider:ClearAnchors()
+    tableLabels.sellersDivider:SetAnchor(TOPLEFT, RZTS.statsParent, TOPLEFT, TABLE_LEFT_MARGIN, afterStatusBlock - 10)
+
+    -- Top sellers: floats with status/progressTrack above, past afterStatusBlock, same
+    -- reasoning -- re-laid-out every render. Side by side, not stacked (2026-10-09): current
+    -- period on the left, overall on the right, sharing the same y and split by x
+    -- (SELLER_COLUMN_WIDTH/SELLER_COLUMN_GAP) instead. ResolveTopSellers is module-scope now
+    -- (see above TopSellers) -- shared with the console options list, which needs the exact
+    -- same live/finalized resolution logic.
     local function LayoutSellerSection(section, x, y, topEntries)
         section.header:ClearAnchors()
         section.header:SetAnchor(TOPLEFT, RZTS.statsParent, TOPLEFT, x, y)
@@ -347,18 +436,16 @@ function RZTS.RenderWeeklyTable()
             local row = section.rows[i]
             row:ClearAnchors()
             row:SetAnchor(TOPLEFT, RZTS.statsParent, TOPLEFT, x, y + SELLER_HEADER_HEIGHT + (i - 1) * SELLER_ROW_HEIGHT)
-            local entry = topEntries[i]
-            row:SetText(entry and (i .. ". " .. entry.name .. ": " .. FormatGold(entry.gold)) or "")
+            row:SetText(FormatSellerLine(i, topEntries[i]))
         end
     end
-    local sellersSectionTop = rowsBottom + SELLERS_TOP_OFFSET
+    local sellersSectionTop = afterStatusBlock
     local currentBucket = s and s.buckets[s.currentStart]
     local currentTopSellers = currentBucket and ResolveTopSellers(currentBucket.sellersTop, currentBucket.sellers) or {}
     local overallTopSellers = s and ResolveTopSellers(s.overallSellersTop, s.overallSellers) or {}
     LayoutSellerSection(tableLabels.sellersCurrent, TABLE_LEFT_MARGIN, sellersSectionTop, currentTopSellers)
     LayoutSellerSection(tableLabels.sellersOverall, TABLE_LEFT_MARGIN + SELLER_COLUMN_WIDTH + SELLER_COLUMN_GAP, sellersSectionTop, overallTopSellers)
 
-    local showProgress = s and (s.phase == "loading" or s.phase == "waiting")
     tableLabels.progressTrack:SetHidden(not showProgress)
     tableLabels.progressFill:SetHidden(not showProgress)
     if showProgress then
@@ -593,23 +680,120 @@ function RZTS.RepositionRefreshButton()
     buttonControl.button:SetAnchor(LEFT, buttonControl, LEFT, 0, 0)
 end
 
+-- Flattened console layout (2026-10-09): same underlying data as the PC "custom" canvas
+-- below (GetSortedWeeks, ResolveTopSellers, RZTS.traderStats), but as a plain vertical list
+-- of LAM "header"/"description" entries instead of a hand-positioned grid. Required because
+-- LAM's own LAM-to-HAS console conversion (LibAddonMenu-2.0.lua's convertLamOptionsToHasTable)
+-- has no equivalent for the "custom" widget type the PC layout depends on -- nothing drawn on
+-- it would ever have appeared on real console hardware. "header"/"description"/"divider" all
+-- have confirmed working converters (see memory/eso-console-port-blockers for the research).
+--
+-- No separate "ensure controls"/render step needed here, unlike the PC canvas: each entry's
+-- text is a function LAM re-evaluates on every panel refresh (registerForRefresh, same
+-- Publish() call the PC canvas relies on), reading RZTS.traderStats fresh each time.
+local function BuildConsoleStatsOptions(optionsTable, startIndex)
+    local nextIndex = startIndex
+    local function Add(entry)
+        entry.width = entry.width or "full"
+        optionsTable[nextIndex] = entry
+        nextIndex = nextIndex + 1
+    end
+
+    Add({
+        type = "header",
+        name = function()
+            return RZTS.savedVars.selectedGuildId and GetGuildName(RZTS.savedVars.selectedGuildId) or "No guild selected"
+        end,
+    })
+    -- Order matches the PC canvas (guild -> weekly rows -> status -> top sellers): status was
+    -- briefly placed right after the guild header, above the weekly rows, which read wrong
+    -- next to the PC layout -- fixed 2026-10-09.
+    --
+    -- One multi-line description, not TABLE_MAX_ROWS separate ones: an earlier version
+    -- reserved a fixed slot per row and left empty ones showing "" -- each still claimed its
+    -- own line of vertical space in LAM's linear widget stacking, which read as a big dead
+    -- gap for any guild without a full 6 weeks of history (confirmed in-game 2026-10-09,
+    -- visibly worse than the PC canvas's equivalent gap because this layout has nothing else
+    -- to visually fill it). One widget whose text is built from only the weeks that actually
+    -- exist has no empty lines left to reserve space for, by construction -- same "derive
+    -- from the data, don't reserve a guess" idea as PC's STATS_CONTROL_HEIGHT.
+    Add({
+        type = "description",
+        text = function()
+            local weeks = GetSortedWeeks()
+            local lines = {}
+            for r = 1, math.min(#weeks, TABLE_MAX_ROWS) do
+                lines[#lines + 1] = FormatWeekLine(weeks[r])
+            end
+            return table.concat(lines, "\n")
+        end,
+    })
+    Add({
+        type = "description",
+        text = function()
+            local s = RZTS.traderStats
+            return s and ("Status: " .. s.status) or ""
+        end,
+    })
+
+    -- Stacked, not side by side like the PC canvas, and staying that way: confirmed by
+    -- reading LibAddonMenu-2.0.lua's convertLamOptionsToHasTable that the LAM-to-HAS console
+    -- conversion drops width/isHalfWidth entirely for every widget type it handles, so there's
+    -- no "half width, pair with the next one" concept on real console at all (that pairing --
+    -- TwinOptionsContainer -- is a keyboard-UI-only LAM behavior). Faking it here with
+    -- width = "half" would look right in the PC FORCE_CONSOLE_UI_FOR_TESTING preview and still
+    -- be wrong on real hardware, which is worse than just being honest about the stacking.
+    -- Same one-multi-line-widget reasoning as the weekly rows above -- a guild with fewer
+    -- than TOP_SELLERS_COUNT distinct sellers so far won't leave empty reserved lines below
+    -- its real ones.
+    local function AddSellerSection(titleText, resolve)
+        Add({ type = "header", name = titleText })
+        Add({
+            type = "description",
+            text = function()
+                local entries = resolve()
+                local lines = {}
+                for i = 1, #entries do
+                    lines[#lines + 1] = FormatSellerLine(i, entries[i])
+                end
+                return table.concat(lines, "\n")
+            end,
+        })
+    end
+    AddSellerSection("Top Sellers - This Period", function()
+        local s = RZTS.traderStats
+        local bucket = s and s.buckets[s.currentStart]
+        return bucket and ResolveTopSellers(bucket.sellersTop, bucket.sellers) or {}
+    end)
+    AddSellerSection("Top Sellers - Overall", function()
+        local s = RZTS.traderStats
+        return s and ResolveTopSellers(s.overallSellersTop, s.overallSellers) or {}
+    end)
+end
+
 -- LibAddonMenu-2.0 registration: gives us a "RodZilla's Trader Stats" entry under
 -- Settings -> Add-Ons, with the weekly table drawn directly on the page via a "custom" LAM
--- widget -- see controls/custom.lua in LibAddonMenu-2.0 -- rather than a separate window.
--- That way switching the guild dropdown just redraws the table in place; there's nothing to
--- open or close. Plus a "/rzts" shortcut straight to the page.
+-- widget on PC -- see controls/custom.lua in LibAddonMenu-2.0 -- rather than a separate
+-- window. That way switching the guild dropdown just redraws the table in place; there's
+-- nothing to open or close. Plus a "/rzts" shortcut straight to the page.
 --
--- IMPORTANT, confirmed by hand 2026-10-09: this panel is NOT reachable without a keyboard,
--- even in PC gamepad-preferred mode -- Settings -> Add-Ons itself isn't a gamepad-navigable
--- screen. (On true console, LAM would hand this off to LibHarvensAddonSettings instead --
--- see LibAddonMenu-2.0.lua's registerConsoleOptionControls -- but that only fires when
--- IsKeyboardUISupported() is false, which is never true on the PC client regardless of
--- input mode or whether that library happens to be installed.) A Bindings.xml keybind was
--- tried as a gamepad-accessible alternative the same day and abandoned: it was assignable
--- in Controls -> Keybindings but never actually fired (a "function expected instead of nil"
--- error from the engine's own dispatcher once placed on an active layer, root cause
--- unresolved). Gamepad access to guild selection remains an open problem.
+-- IMPORTANT, confirmed by hand 2026-10-09: on PC, this panel is NOT reachable without a
+-- keyboard, even in gamepad-preferred mode -- Settings -> Add-Ons itself isn't a
+-- gamepad-navigable screen there. A Bindings.xml keybind was tried as a gamepad-accessible
+-- alternative the same day and abandoned: it was assignable in Controls -> Keybindings but
+-- never actually fired (a "function expected instead of nil" error from the engine's own
+-- dispatcher once placed on an active layer, root cause unresolved). That problem is specific
+-- to the PC keyboard-UI Settings menu, though -- real console hardware's entire UI is
+-- gamepad-native, and LAM hands console panels off to LibHarvensAddonSettings (via its
+-- bethesda.net replacement, LibVotans) instead, which is itself a gamepad-native menu. The
+-- remaining problem there isn't reachability, it's widget support -- see
+-- BuildConsoleStatsOptions above.
 function RZTS.RegisterAddonMenu()
+    if FORCE_CONSOLE_UI_FOR_TESTING then
+        d("|cFF0000RodZilla's Trader Stats|r: FORCE_CONSOLE_UI_FOR_TESTING is ON -- showing " ..
+            "the console layout preview, not the real PC layout. Flip it off before shipping.")
+    end
+
     -- LibAddonMenu2 global, not LibStub -- LibStub is deprecated/obsolete since the
     -- Summerset chapter (ESO's own add-on versioning made it redundant); confirmed
     -- 2026-10-02 against LibAddonMenu's own ESOUI page.
@@ -668,19 +852,47 @@ function RZTS.RegisterAddonMenu()
                 return s ~= nil and s.phase ~= "done" and s.phase ~= "error"
             end,
         },
-        [3] = {
-            -- The same full-width rule used throughout the base game's own Settings panels --
-            -- see controls/divider.lua in LibAddonMenu-2.0, "ZO_Options_Divider" -- bracketing
-            -- the stats block below to set it off from the guild picker/refresh row above.
-            -- alpha = 1 to match the second divider (sellersDivider in EnsureTableControls):
-            -- that one is the same ZO_Options_Divider template created directly, without going
-            -- through this LAM widget wrapper, which defaults alpha to 0.25 (see
-            -- controls/divider.lua's DEFAULT_ALPHA) and looked noticeably fainter as a result.
-            type = "divider",
+    }
+
+    -- Platform fork: the hand-positioned "custom" canvas on PC vs. the flattened
+    -- header/description list on console -- see BuildConsoleStatsOptions and
+    -- RegisterAddonMenu's comment above for why these can't share one implementation.
+    if IsConsoleUI() then
+        -- No separate top divider here (2026-10-09, fixed a real double-divider bug): the
+        -- "header" widget type BuildConsoleStatsOptions uses for the guild name (and for both
+        -- Top Sellers sections) already draws its own ZO_Options_Divider above itself -- see
+        -- controls/header.lua. An explicit divider widget placed right before it stacked two
+        -- dividers back to back, confirmed in-game. The PC branch below still needs its own
+        -- hand-drawn one (EnsureTableControls' topDivider) because its first element is a
+        -- plain label, not a "header" widget, so it has no built-in divider to rely on.
+        --
+        -- A near-zero-height "custom" widget whose only job is repositioning the guild
+        -- dropdown/refresh button (see RepositionGuildDropdown/RepositionRefreshButton
+        -- above) once they're guaranteed to exist. Needed specifically on this branch
+        -- because header/description (what BuildConsoleStatsOptions is otherwise made of)
+        -- expose no createFunc hook to run this from -- "custom" is the only widget type
+        -- whose createFunc is guaranteed to run inside the same synchronous widget-creation
+        -- pass as the dropdown/button at [1]/[2] -- see LibAddonMenu-2.0.lua's
+        -- CreateWidgetsInPanel, which creates widgets in index order.
+        --
+        -- Harmless on real console hardware either way: LAM never creates "custom" widgets
+        -- there at all (no HAS equivalent), so this would be a no-op there -- but it still
+        -- matters for the on-PC FORCE_CONSOLE_UI_FOR_TESTING preview, which really does
+        -- render it through LAM's normal keyboard-UI "custom" widget.
+        optionsTable[3] = {
+            type = "custom",
+            reference = "RodZillaTraderStatsRepositionHook",
             width = "full",
-            alpha = 1,
-        },
-        [4] = {
+            minHeight = 1,
+            maxHeight = 1,
+            createFunc = function()
+                RZTS.RepositionGuildDropdown()
+                RZTS.RepositionRefreshButton()
+            end,
+        }
+        BuildConsoleStatsOptions(optionsTable, 4)
+    else
+        optionsTable[3] = {
             -- The weekly table itself, drawn directly on the settings page. See
             -- controls/custom.lua in LibAddonMenu-2.0 for what this widget type provides.
             type = "custom",
@@ -696,8 +908,8 @@ function RZTS.RegisterAddonMenu()
                 RZTS.RenderWeeklyTable()
             end,
             refreshFunc = function() RZTS.RenderWeeklyTable() end,
-        },
-    }
+        }
+    end
 
     RZTS.panel = LAM:RegisterAddonPanel(RZTS.name, panelData)
     LAM:RegisterOptionControls(RZTS.name, optionsTable)

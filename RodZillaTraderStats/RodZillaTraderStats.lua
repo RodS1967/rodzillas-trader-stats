@@ -400,6 +400,19 @@ function RZTS.RepositionGuildDropdown()
     dropdownControl.container:SetAnchor(TOPLEFT, dropdownControl, TOPLEFT, 0, 0)
 end
 
+-- LAM centers a half-width button's actual button graphic within its own slot by design --
+-- see button.lua, LAMCreateControl.button: `button:SetAnchor(control.isHalfWidth and CENTER
+-- or RIGHT)`, no widgetData option to change that either. Same override pattern and timing
+-- as RepositionGuildDropdown above.
+function RZTS.RepositionRefreshButton()
+    local buttonControl = RodZillaTraderStatsRefreshButton
+    if not buttonControl or RZTS.refreshButtonRepositioned then return end
+    RZTS.refreshButtonRepositioned = true
+
+    buttonControl.button:ClearAnchors()
+    buttonControl.button:SetAnchor(LEFT, buttonControl, LEFT, 0, 0)
+end
+
 -- LibAddonMenu-2.0 registration: gives us a "RodZilla's Trader Stats" entry under
 -- Settings -> Add-Ons, with the weekly table drawn directly on the page via a "custom" LAM
 -- widget -- see controls/custom.lua in LibAddonMenu-2.0 -- rather than a separate window.
@@ -459,6 +472,9 @@ function RZTS.RegisterAddonMenu()
         [2] = {
             type = "button",
             name = "Refresh",
+            -- Global control name -- lets RZTS.RepositionRefreshButton find this control
+            -- after LAM creates it, to override its stock centered position (see that function).
+            reference = "RodZillaTraderStatsRefreshButton",
             tooltip = "Re-checks this guild's trader history. Mainly useful to retry after an error.",
             func = function() RZTS.ComputeTraderStats() end,
             width = "half",
@@ -480,6 +496,7 @@ function RZTS.RegisterAddonMenu()
             createFunc = function(control)
                 RZTS.statsParent = control
                 RZTS.RepositionGuildDropdown()
+                RZTS.RepositionRefreshButton()
                 RZTS.EnsureTableControls(control)
                 RZTS.RenderWeeklyTable()
             end,

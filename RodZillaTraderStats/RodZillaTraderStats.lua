@@ -51,7 +51,9 @@ local function LastHireCutoff(now)
 end
 
 -- Only totals are kept, never the events themselves. Sales are bucketed by weekly hire
--- period; RZTS.traderStats is the one live summary and is replaced on every scan or guild change.
+-- period; RZTS.traderStats is the one current summary and is replaced on every scan or guild
+-- change -- "current," not "live": see the point-in-time-snapshot note above, this isn't a
+-- continuously-updating tracker.
 RZTS.traderStats = nil
 RZTS.traderProcessor = nil
 RZTS.panel = nil
@@ -201,6 +203,19 @@ local function ResolveTopSellers(sellersTop, sellersFull)
     return TopSellers(sellersFull or {}, TOP_SELLERS_COUNT)
 end
 
+-- This period's / all time's top sellers off the live scan state. Shared by the PC canvas
+-- (RenderWeeklyTable) and the console options list (BuildConsoleStatsOptions) -- both used to
+-- carry their own copy of this exact lookup.
+local function GetCurrentTopSellers()
+    local s = RZTS.traderStats
+    local bucket = s and s.buckets[s.currentStart]
+    return bucket and ResolveTopSellers(bucket.sellersTop, bucket.sellers) or {}
+end
+local function GetOverallTopSellers()
+    local s = RZTS.traderStats
+    return s and ResolveTopSellers(s.overallSellersTop, s.overallSellers) or {}
+end
+
 -- Sorted newest-first, same as the PC table rows. Shared helper so the console options list
 -- (built fresh from scratch) and the PC canvas (RenderWeeklyTable) can't drift apart on sort
 -- order.
@@ -286,14 +301,16 @@ function RZTS.EnsureTableControls(parent)
         end
         tableLabels.rows[r] = cells
     end
-    -- Hand-drawn divider (same ZO_Options_Divider template as sellersDivider below), not the
-    -- LAM "divider" widget type used for the one above the Refresh button row -- that type
-    -- can't sit any tighter than LAM's own fixed +15 inter-widget gap on both sides of it
-    -- (confirmed in-game 2026-10-09, measured: divider bottom 398, next widget top 413 -- a
-    -- flat constant inside LibAddonMenu-2.0.lua's CreateAndAnchorWidget, not ours to tune).
-    -- Drawing it ourselves, inside the canvas, means only the top side pays that LAM gap (the
-    -- canvas widget itself still sits 15px below the Refresh button, unavoidably) -- the
-    -- guild name below it can sit as tight as we want, same as sellersDivider/Top Sellers.
+    -- Hand-drawn divider (same ZO_Options_Divider template as sellersDivider below), not a
+    -- LAM "divider" widget -- that type can't sit any tighter than LAM's own fixed +15px
+    -- inter-widget gap on both sides of it (confirmed in-game 2026-10-09, measured: divider
+    -- bottom 398, next widget top 413 -- a flat constant inside LibAddonMenu-2.0.lua's
+    -- CreateAndAnchorWidget, not ours to tune). Drawing it ourselves, inside the canvas,
+    -- means only the top side pays that LAM gap (the canvas widget itself still sits 15px
+    -- below the Refresh button, unavoidably) -- the guild name below it can sit as tight as
+    -- we want, same as sellersDivider/Top Sellers. There's no LAM divider widget left in this
+    -- panel at all now (PC draws both its dividers by hand; console relies on the "header"
+    -- widget's own built-in one -- see RegisterAddonMenu).
     tableLabels.topDivider = WINDOW_MANAGER:CreateControlFromVirtual(nil, parent, "ZO_Options_Divider")
     tableLabels.topDivider:SetWidth(TABLE_CONTENT_WIDTH)
     tableLabels.topDivider:SetAnchor(TOPLEFT, parent, TOPLEFT, TABLE_LEFT_MARGIN, 0)
@@ -327,10 +344,9 @@ function RZTS.EnsureTableControls(parent)
     tableLabels.progressFill:SetHidden(true)
 
     -- Divider between the weekly table/status/progress area and the top sellers section
-    -- below -- the same virtual control LAM's own "divider" widget type uses
-    -- (ZO_Options_Divider, see controls/divider.lua), so it matches the two divider widgets
-    -- already bracketing this whole block at the panel level. Positioned dynamically in
-    -- RenderWeeklyTable, same reasoning as status/progressTrack above.
+    -- below -- same hand-drawn ZO_Options_Divider approach as topDivider above, for the same
+    -- reason (tighter than a real LAM "divider" widget would allow). Positioned dynamically
+    -- in RenderWeeklyTable, same reasoning as status/progressTrack above.
     tableLabels.sellersDivider = WINDOW_MANAGER:CreateControlFromVirtual(nil, parent, "ZO_Options_Divider")
     tableLabels.sellersDivider:SetWidth(TABLE_CONTENT_WIDTH)
 
@@ -426,9 +442,9 @@ function RZTS.RenderWeeklyTable()
     -- Top sellers: floats with status/progressTrack above, past afterStatusBlock, same
     -- reasoning -- re-laid-out every render. Side by side, not stacked (2026-10-09): current
     -- period on the left, overall on the right, sharing the same y and split by x
-    -- (SELLER_COLUMN_WIDTH/SELLER_COLUMN_GAP) instead. ResolveTopSellers is module-scope now
-    -- (see above TopSellers) -- shared with the console options list, which needs the exact
-    -- same live/finalized resolution logic.
+    -- (SELLER_COLUMN_WIDTH/SELLER_COLUMN_GAP) instead. GetCurrentTopSellers/
+    -- GetOverallTopSellers (see above TopSellers) are module-scope -- shared with the console
+    -- options list below, which needs the exact same live/finalized resolution logic.
     local function LayoutSellerSection(section, x, y, topEntries)
         section.header:ClearAnchors()
         section.header:SetAnchor(TOPLEFT, RZTS.statsParent, TOPLEFT, x, y)
@@ -440,11 +456,8 @@ function RZTS.RenderWeeklyTable()
         end
     end
     local sellersSectionTop = afterStatusBlock
-    local currentBucket = s and s.buckets[s.currentStart]
-    local currentTopSellers = currentBucket and ResolveTopSellers(currentBucket.sellersTop, currentBucket.sellers) or {}
-    local overallTopSellers = s and ResolveTopSellers(s.overallSellersTop, s.overallSellers) or {}
-    LayoutSellerSection(tableLabels.sellersCurrent, TABLE_LEFT_MARGIN, sellersSectionTop, currentTopSellers)
-    LayoutSellerSection(tableLabels.sellersOverall, TABLE_LEFT_MARGIN + SELLER_COLUMN_WIDTH + SELLER_COLUMN_GAP, sellersSectionTop, overallTopSellers)
+    LayoutSellerSection(tableLabels.sellersCurrent, TABLE_LEFT_MARGIN, sellersSectionTop, GetCurrentTopSellers())
+    LayoutSellerSection(tableLabels.sellersOverall, TABLE_LEFT_MARGIN + SELLER_COLUMN_WIDTH + SELLER_COLUMN_GAP, sellersSectionTop, GetOverallTopSellers())
 
     tableLabels.progressTrack:SetHidden(not showProgress)
     tableLabels.progressFill:SetHidden(not showProgress)
@@ -521,7 +534,6 @@ function RZTS.ComputeTraderStats()
     local currentStart = LastHireCutoff(now)
     local kiosk = GetGuildOwnedKioskInfo(guildId)
     local stats = {
-        kiosk = kiosk,
         currentStart = currentStart,
         buckets = { [currentStart] = { start = currentStart, kiosk = kiosk, sales = 0, gold = 0, tax = 0, sellers = {} } },
         -- Seller display name -> gold total, across every bucket seen this scan (bounded by
@@ -655,8 +667,9 @@ end
 -- anchors the actual control to the right -- see CreateLabelAndContainerControl in
 -- LibAddonMenu-2.0.lua -- there's no widgetData option to change that. This runs once,
 -- right after the dropdown is guaranteed to exist: it's optionsTable[1], created before
--- the "custom" table widget ([3]) whose createFunc calls this, in the same synchronous
--- pass -- see LAM's CreateWidgetsInPanel, which creates widgets in index order.
+-- optionsTable[3] (the PC canvas or the console repositioning hook, depending on platform --
+-- see RegisterAddonMenu) whose createFunc calls this, in the same synchronous pass -- see
+-- LAM's CreateWidgetsInPanel, which creates widgets in index order.
 function RZTS.RepositionGuildDropdown()
     local dropdownControl = RodZillaTraderStatsGuildDropdown
     if not dropdownControl or RZTS.guildDropdownRepositioned then return end
@@ -760,15 +773,8 @@ local function BuildConsoleStatsOptions(optionsTable, startIndex)
             end,
         })
     end
-    AddSellerSection("Top Sellers - This Period", function()
-        local s = RZTS.traderStats
-        local bucket = s and s.buckets[s.currentStart]
-        return bucket and ResolveTopSellers(bucket.sellersTop, bucket.sellers) or {}
-    end)
-    AddSellerSection("Top Sellers - Overall", function()
-        local s = RZTS.traderStats
-        return s and ResolveTopSellers(s.overallSellersTop, s.overallSellers) or {}
-    end)
+    AddSellerSection("Top Sellers - This Period", GetCurrentTopSellers)
+    AddSellerSection("Top Sellers - Overall", GetOverallTopSellers)
 end
 
 -- LibAddonMenu-2.0 registration: gives us a "RodZilla's Trader Stats" entry under

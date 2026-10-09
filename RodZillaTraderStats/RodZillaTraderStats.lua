@@ -55,11 +55,18 @@ RZTS.statsParent = nil -- the LAM custom control the table is drawn on; set once
 -- panel via a LAM "custom" widget rather than a separate window -- so switching guilds in
 -- the dropdown just redraws this block in place, with no window to open or close.
 local WEEK_SECONDS = 7 * 86400
-local TABLE_MAX_ROWS = 14
+-- 2026-10-09: dropped from 14 to 6 -- sales history realistically won't run that deep, and
+-- 14 rows' worth of reserved vertical space was mostly wasted. If a guild ever genuinely
+-- needs more than 6 weeks shown, bump this back up (the status line already warns when
+-- rows are being hidden -- see "showing newest N weeks" below -- so it won't go unnoticed).
+local TABLE_MAX_ROWS = 6
 local TABLE_ROW_TOP = 70
 local TABLE_ROW_HEIGHT = 24
 local TABLE_ROWS_BOTTOM = TABLE_ROW_TOP + TABLE_MAX_ROWS * TABLE_ROW_HEIGHT
-local STATS_CONTROL_HEIGHT = 500
+-- Derived from the row count rather than a separate fixed number, so this can't drift out
+-- of sync with TABLE_MAX_ROWS again: rows end at TABLE_ROWS_BOTTOM, the progress bar sits
+-- 60px below that and is 14px tall, plus 20px of trailing padding underneath it.
+local STATS_CONTROL_HEIGHT = TABLE_ROWS_BOTTOM + 60 + 14 + 20
 -- Left/right padding for everything in this block (table columns, status text, progress
 -- bar). The panel's real content width was unknown all day (two guesses, 740 then 710,
 -- were both too wide) until actually measured in-game 2026-10-09: parent:GetWidth() = 585.
@@ -208,6 +215,18 @@ function RZTS.RenderWeeklyTable()
     local textWidth = tableLabels.guild:GetTextWidth()
     tableLabels.underline:SetWidth(textWidth)
     tableLabels.underline:SetAnchor(TOPLEFT, RZTS.statsParent, TOPLEFT, (RZTS.statsParent:GetWidth() - textWidth) / 2, tableLabels.guild:GetTextHeight() + 2)
+
+    -- Status (and the progress bar below it) float up to sit right after the last row that
+    -- actually has data, instead of always sitting below all TABLE_MAX_ROWS slots whether
+    -- they're populated or not -- re-anchored every render since the row count changes as
+    -- data loads in. Capped at TABLE_MAX_ROWS since rows past that never get drawn.
+    local populatedRows = math.min(#weeks, TABLE_MAX_ROWS)
+    local rowsBottom = TABLE_ROW_TOP + populatedRows * TABLE_ROW_HEIGHT
+    tableLabels.status:ClearAnchors()
+    tableLabels.status:SetAnchor(TOPLEFT, RZTS.statsParent, TOPLEFT, TABLE_LEFT_MARGIN, rowsBottom + 10)
+    tableLabels.progressTrack:ClearAnchors()
+    tableLabels.progressTrack:SetAnchor(TOPLEFT, RZTS.statsParent, TOPLEFT, TABLE_LEFT_MARGIN, rowsBottom + 60)
+
     tableLabels.status:SetText(s and ("Status: " .. s.status .. (#weeks > TABLE_MAX_ROWS and " (showing newest " .. TABLE_MAX_ROWS .. " weeks)" or "")) or "")
 
     local showProgress = s and (s.phase == "loading" or s.phase == "waiting")

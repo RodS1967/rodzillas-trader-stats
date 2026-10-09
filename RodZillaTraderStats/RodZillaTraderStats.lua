@@ -8,6 +8,13 @@ local RZTS = RodZillaTraderStats
 -- Deliberately NOT storing the raw event log long-term -- keeps SavedVariables/memory footprint
 -- small regardless of guild sales volume, and console has a 100MB total addon size cap plus
 -- less available memory than PC.
+--
+-- 2026-10-09: this extends to in-memory, per-scan data too, not just SavedVariables -- the
+-- displayName -> gold breakdown used to rank top sellers (ComputeTraderStats) is explicitly
+-- a point-in-time snapshot, not a live-updating tracker. The processor stops itself once
+-- caught up (SetStopOnLastCachedEvent) instead of listening for new sales indefinitely, and
+-- the full breakdown is discarded (FinalizeSellerStats) the moment that happens, since
+-- nothing could change the rankings after that point. Hit Refresh for a new snapshot.
 function RZTS.InitializeSavedVars()
     RZTS.savedVars = ZO_SavedVars:NewAccountWide("RodZillaTraderStats_SavedVars", 1, nil, {
         selectedGuildId = nil,
@@ -63,10 +70,27 @@ local TABLE_MAX_ROWS = 6
 local TABLE_ROW_TOP = 70
 local TABLE_ROW_HEIGHT = 24
 local TABLE_ROWS_BOTTOM = TABLE_ROW_TOP + TABLE_MAX_ROWS * TABLE_ROW_HEIGHT
--- Derived from the row count rather than a separate fixed number, so this can't drift out
--- of sync with TABLE_MAX_ROWS again: rows end at TABLE_ROWS_BOTTOM, the progress bar sits
--- 60px below that and is 14px tall, plus 20px of trailing padding underneath it.
-local STATS_CONTROL_HEIGHT = TABLE_ROWS_BOTTOM + 60 + 14 + 20
+-- Top sellers: two mini-leaderboards (this week, and everything LibHistoire currently has
+-- cached for this guild) added below the status/progress area 2026-10-09, laid out side by
+-- side -- current period on the left, overall on the right -- rather than stacked (changed
+-- same day after seeing it stacked in-game; side by side spends the width this panel has
+-- plenty of instead of the vertical space it doesn't).
+local TOP_SELLERS_COUNT = 3
+local SELLER_ROW_HEIGHT = 20
+local SELLER_HEADER_HEIGHT = 22
+local SELLER_COLUMN_GAP = 20 -- horizontal gap between the "This Period" and "Overall" columns
+local SELLER_SECTION_HEIGHT = SELLER_HEADER_HEIGHT + TOP_SELLERS_COUNT * SELLER_ROW_HEIGHT
+-- Offset from rowsBottom (see RenderWeeklyTable) to where the sellers block starts: past the
+-- progress bar's own reserved space (60 + 14, same as the status text's offset below), plus
+-- a visual gap.
+local SELLERS_TOP_OFFSET = 60 + 14 + 20
+
+-- Derived from the row count and the sellers block rather than separate fixed numbers, so
+-- this can't drift out of sync with either again: rows end at TABLE_ROWS_BOTTOM, the sellers
+-- block starts SELLERS_TOP_OFFSET below that and holds one row's worth of height -- both
+-- columns sit side by side and share it -- plus 20px of trailing padding underneath it all.
+local STATS_CONTROL_HEIGHT =
+    TABLE_ROWS_BOTTOM + SELLERS_TOP_OFFSET + SELLER_SECTION_HEIGHT + 20
 -- Left/right padding for everything in this block (table columns, status text, progress
 -- bar). The panel's real content width was unknown all day (two guesses, 740 then 710,
 -- were both too wide) until actually measured in-game 2026-10-09: parent:GetWidth() = 585.
@@ -81,6 +105,8 @@ local TABLE_LEFT_MARGIN = 0
 -- accounts for its space or not.
 local TABLE_RIGHT_MARGIN = 0
 local TABLE_CONTENT_WIDTH = MEASURED_PANEL_WIDTH - TABLE_LEFT_MARGIN - TABLE_RIGHT_MARGIN
+-- Top sellers columns: half the panel's content width each, less half the gap between them.
+local SELLER_COLUMN_WIDTH = (TABLE_CONTENT_WIDTH - SELLER_COLUMN_GAP) / 2
 
 -- No x values -- positions are computed left-to-right below (ComputeColumnPositions), each
 -- column starting exactly where the previous one ends. A previous version anchored the
@@ -117,6 +143,39 @@ end
 local function FormatGold(amount)
     local digits = tostring(math.floor(amount)):reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
     return digits .. "g"
+end
+
+-- sellerTotals: {displayName -> gold}, as accumulated in ComputeTraderStats. Returns up to
+-- `count` entries, highest gold first, as {name, gold} -- fewer if there aren't that many
+-- distinct sellers yet.
+local function TopSellers(sellerTotals, count)
+    local list = {}
+    for name, gold in pairs(sellerTotals) do
+        list[#list + 1] = { name = name, gold = gold }
+    end
+    table.sort(list, function(a, b) return a.gold > b.gold end)
+    local top = {}
+    for i = 1, math.min(count, #list) do
+        top[i] = list[i]
+    end
+    return top
+end
+
+-- Called once a scan reaches the real end of what LibHistoire has cached (see
+-- SetOnStopCallback, StopReason.LAST_CACHED_EVENT_REACHED) -- replaces each full
+-- displayName -> gold breakdown with just the few entries actually shown (sellersTop,
+-- overallSellersTop), and drops the full table entirely. Safe specifically because the
+-- processor has stopped (SetStopOnLastCachedEvent) rather than continuing to listen for
+-- new sales -- see ComputeTraderStats for why that tradeoff was made: this is a
+-- point-in-time snapshot, not a live tracker, so there's nothing left that could still
+-- change the rankings once this runs.
+function RZTS.FinalizeSellerStats(stats)
+    stats.overallSellersTop = TopSellers(stats.overallSellers, TOP_SELLERS_COUNT)
+    stats.overallSellers = nil
+    for _, bucket in pairs(stats.buckets) do
+        bucket.sellersTop = TopSellers(bucket.sellers, TOP_SELLERS_COUNT)
+        bucket.sellers = nil
+    end
 end
 
 local function CreateTableCell(parent, column, x, y, font)
@@ -177,6 +236,36 @@ function RZTS.EnsureTableControls(parent)
     tableLabels.progressFill:SetHeight(14)
     tableLabels.progressFill:SetAnchor(TOPLEFT, tableLabels.progressTrack, TOPLEFT, 0, 0)
     tableLabels.progressFill:SetHidden(true)
+
+    -- Divider between the weekly table/status/progress area and the top sellers section
+    -- below -- the same virtual control LAM's own "divider" widget type uses
+    -- (ZO_Options_Divider, see controls/divider.lua), so it matches the two divider widgets
+    -- already bracketing this whole block at the panel level. Positioned dynamically in
+    -- RenderWeeklyTable, same reasoning as status/progressTrack above.
+    tableLabels.sellersDivider = WINDOW_MANAGER:CreateControlFromVirtual(nil, parent, "ZO_Options_Divider")
+    tableLabels.sellersDivider:SetWidth(TABLE_CONTENT_WIDTH)
+
+    -- Top sellers: positions set dynamically in RenderWeeklyTable (same reasoning as status/
+    -- progressTrack above -- they float up or down depending on how many table rows are
+    -- actually populated), text populated there too. Just create the controls here.
+    local function CreateSellerSection(titleText)
+        local section = { rows = {} }
+        section.header = WINDOW_MANAGER:CreateControl(nil, parent, CT_LABEL)
+        section.header:SetFont("ZoFontWinH5")
+        section.header:SetText(titleText)
+        for i = 1, TOP_SELLERS_COUNT do
+            local row = WINDOW_MANAGER:CreateControl(nil, parent, CT_LABEL)
+            row:SetFont("ZoFontGame")
+            row:SetWidth(SELLER_COLUMN_WIDTH)
+            row:SetWrapMode(TEXT_WRAP_MODE_ELLIPSIS)
+            row:SetMaxLineCount(1)
+            section.rows[i] = row
+        end
+        return section
+    end
+    tableLabels.sellersCurrent = CreateSellerSection("Top Sellers - This Period")
+    tableLabels.sellersOverall = CreateSellerSection("Top Sellers - Overall")
+
     RZTS.tableLabels = tableLabels
 end
 
@@ -228,6 +317,46 @@ function RZTS.RenderWeeklyTable()
     tableLabels.progressTrack:SetAnchor(TOPLEFT, RZTS.statsParent, TOPLEFT, TABLE_LEFT_MARGIN, rowsBottom + 60)
 
     tableLabels.status:SetText(s and ("Status: " .. s.status .. (#weeks > TABLE_MAX_ROWS and " (showing newest " .. TABLE_MAX_ROWS .. " weeks)" or "")) or "")
+
+    -- Divider floats with status/progressTrack above -- sits in the middle of the 20px gap
+    -- between the progress bar's reserved space (rowsBottom + 60 + 14) and the top sellers
+    -- section (rowsBottom + SELLERS_TOP_OFFSET), so it reads as "under the weekly stats,
+    -- above the top sellers" without needing any extra reserved height of its own.
+    tableLabels.sellersDivider:ClearAnchors()
+    tableLabels.sellersDivider:SetAnchor(TOPLEFT, RZTS.statsParent, TOPLEFT, TABLE_LEFT_MARGIN, rowsBottom + 84)
+
+    -- Top sellers: floats with status/progressTrack above, past the progress bar's own
+    -- reserved space (SELLERS_TOP_OFFSET), same reasoning -- re-laid-out every render.
+    -- Side by side, not stacked (2026-10-09): current period on the left, overall on the
+    -- right, sharing the same y and split by x (SELLER_COLUMN_WIDTH/SELLER_COLUMN_GAP)
+    -- instead.
+    --
+    -- Two possible shapes per bucket/overall: while still scanning, "sellers" is the full
+    -- live displayName -> gold table and gets ranked fresh here; once FinalizeSellerStats
+    -- has run (scan reached StopReason.LAST_CACHED_EVENT_REACHED), "sellers" is gone and
+    -- "sellersTop" is the already-ranked, already-trimmed array -- used directly, not
+    -- re-ranked, since the full breakdown behind it no longer exists.
+    local function ResolveTopSellers(sellersTop, sellersFull)
+        if sellersTop then return sellersTop end
+        return TopSellers(sellersFull or {}, TOP_SELLERS_COUNT)
+    end
+    local function LayoutSellerSection(section, x, y, topEntries)
+        section.header:ClearAnchors()
+        section.header:SetAnchor(TOPLEFT, RZTS.statsParent, TOPLEFT, x, y)
+        for i = 1, TOP_SELLERS_COUNT do
+            local row = section.rows[i]
+            row:ClearAnchors()
+            row:SetAnchor(TOPLEFT, RZTS.statsParent, TOPLEFT, x, y + SELLER_HEADER_HEIGHT + (i - 1) * SELLER_ROW_HEIGHT)
+            local entry = topEntries[i]
+            row:SetText(entry and (i .. ". " .. entry.name .. ": " .. FormatGold(entry.gold)) or "")
+        end
+    end
+    local sellersSectionTop = rowsBottom + SELLERS_TOP_OFFSET
+    local currentBucket = s and s.buckets[s.currentStart]
+    local currentTopSellers = currentBucket and ResolveTopSellers(currentBucket.sellersTop, currentBucket.sellers) or {}
+    local overallTopSellers = s and ResolveTopSellers(s.overallSellersTop, s.overallSellers) or {}
+    LayoutSellerSection(tableLabels.sellersCurrent, TABLE_LEFT_MARGIN, sellersSectionTop, currentTopSellers)
+    LayoutSellerSection(tableLabels.sellersOverall, TABLE_LEFT_MARGIN + SELLER_COLUMN_WIDTH + SELLER_COLUMN_GAP, sellersSectionTop, overallTopSellers)
 
     local showProgress = s and (s.phase == "loading" or s.phase == "waiting")
     tableLabels.progressTrack:SetHidden(not showProgress)
@@ -307,7 +436,11 @@ function RZTS.ComputeTraderStats()
     local stats = {
         kiosk = kiosk,
         currentStart = currentStart,
-        buckets = { [currentStart] = { start = currentStart, kiosk = kiosk, sales = 0, gold = 0, tax = 0 } },
+        buckets = { [currentStart] = { start = currentStart, kiosk = kiosk, sales = 0, gold = 0, tax = 0, sellers = {} } },
+        -- Seller display name -> gold total, across every bucket seen this scan (bounded by
+        -- however far back LibHistoire's own Trader cache retention goes, not true lifetime
+        -- history -- there's no persistent storage of our own backing this).
+        overallSellers = {},
         salesSoFar = 0,
         status = "scanning",
         phase = "scanning", -- scanning (just starting) | waiting (LibHistoire not gapless yet) | loading (draining cache) | done | error
@@ -338,22 +471,49 @@ function RZTS.ComputeTraderStats()
             return
         end
 
+        -- A snapshot, not a live tracker: without this, the processor keeps listening for
+        -- brand-new sales indefinitely after catching up (LibHistoire's default behavior --
+        -- see GuildHistoryEventProcessor.lua, the "RegisterForFutureEvents" branch). That
+        -- would mean never actually being done with the full per-seller breakdown for as
+        -- long as this guild stays selected, since a new sale could always change who
+        -- belongs in the top sellers. Must be called before the processor starts running.
+        processor:SetStopOnLastCachedEvent(true)
+
         processor:SetNextEventCallback(function(event)
             local info = event:GetEventInfo()
             if info.eventType ~= GUILD_HISTORY_TRADER_EVENT_ITEM_SOLD then return end
             local start = LastHireCutoff(info.timestampS)
             local bucket = stats.buckets[start]
             if not bucket then
-                bucket = { start = start, sales = 0, gold = 0, tax = 0 }
+                bucket = { start = start, sales = 0, gold = 0, tax = 0, sellers = {} }
                 stats.buckets[start] = bucket
             end
             bucket.sales = bucket.sales + 1
             bucket.gold = bucket.gold + info.price
             bucket.tax = bucket.tax + info.tax
+
+            local seller = info.sellerDisplayName or "?"
+            bucket.sellers[seller] = (bucket.sellers[seller] or 0) + info.price
+            stats.overallSellers[seller] = (stats.overallSellers[seller] or 0) + info.price
+
             stats.salesSoFar = stats.salesSoFar + 1
         end)
-        processor:SetOnStopCallback(function()
-            if RZTS.traderStats == stats and stats.phase ~= "done" then
+        processor:SetOnStopCallback(function(reason)
+            if RZTS.traderStats ~= stats then return end
+            if reason == LibHistoire.StopReason.LAST_CACHED_EVENT_REACHED then
+                -- The expected, normal way this scan ends: caught up to everything
+                -- LibHistoire currently has cached, and (per SetStopOnLastCachedEvent
+                -- above) not listening for anything further. This is the one point where
+                -- the full per-seller breakdown has zero more use -- no more events are
+                -- coming on this processor to possibly change the rankings -- so finalize
+                -- it down to just what's displayed and let the rest be freed.
+                stats.phase = "done"
+                stats.status = string.format("up to date (%d sales)", stats.salesSoFar)
+                RZTS.FinalizeSellerStats(stats)
+                Publish()
+            elseif reason ~= LibHistoire.StopReason.MANUAL_STOP then
+                -- MANUAL_STOP is us, via ClearTraderStats (switching guilds/refreshing) --
+                -- expected, not a failure. Anything else (e.g. MANAGED_RANGE_LOST) is.
                 Fail("stopped early")
             end
         end)
@@ -367,21 +527,22 @@ function RZTS.ComputeTraderStats()
         -- The guild is already confirmed gapless at this point, so this is purely a local
         -- cache read -- no further network wait, just however long it takes to drain what's
         -- already on disk. The determinate bar reflects that real, bounded amount of work.
+        --
+        -- Only owns the progress-bar display while events are still draining -- the actual
+        -- "done" transition (and finalizing seller stats) belongs to SetOnStopCallback above,
+        -- which fires exactly when the processor itself confirms there's truly nothing left,
+        -- rather than this polling loop guessing it from a metrics count that could read 0
+        -- slightly before the processor's own internal queue has caught up.
         local function Poll()
-            if RZTS.traderStats ~= stats or stats.phase == "error" then return end
+            if RZTS.traderStats ~= stats or stats.phase == "error" or stats.phase == "done" then return end
             local remaining = processor:GetPendingEventMetrics()
             if remaining > 0 then
                 stats.phase = "loading"
                 stats.loadTotal = stats.loadTotal or remaining -- fix the denominator at the first reading
                 stats.loadRemaining = remaining
                 stats.status = string.format("loading cached sales (%d so far, %d queued)", stats.salesSoFar, remaining)
-            else
-                stats.phase = "done"
-                stats.status = string.format("up to date (%d sales)", stats.salesSoFar)
                 Publish()
-                return
             end
-            Publish()
             zo_callLater(Poll, 1000)
         end
         zo_callLater(Poll, 500)
@@ -494,7 +655,10 @@ function RZTS.RegisterAddonMenu()
             -- Global control name -- lets RZTS.RepositionRefreshButton find this control
             -- after LAM creates it, to override its stock centered position (see that function).
             reference = "RodZillaTraderStatsRefreshButton",
-            tooltip = "Re-checks this guild's trader history. Mainly useful to retry after an error.",
+            -- The numbers shown are a point-in-time snapshot, not a live tracker (see
+            -- ComputeTraderStats, SetStopOnLastCachedEvent) -- this is how you get a fresh
+            -- one, not just how you retry after an error.
+            tooltip = "Re-checks this guild's trader history for anything new since the last check, or to retry after an error.",
             func = function() RZTS.ComputeTraderStats() end,
             width = "half",
             -- Disabled while a scan is actively running, so a second press can't restart it
@@ -505,6 +669,18 @@ function RZTS.RegisterAddonMenu()
             end,
         },
         [3] = {
+            -- The same full-width rule used throughout the base game's own Settings panels --
+            -- see controls/divider.lua in LibAddonMenu-2.0, "ZO_Options_Divider" -- bracketing
+            -- the stats block below to set it off from the guild picker/refresh row above.
+            -- alpha = 1 to match the second divider (sellersDivider in EnsureTableControls):
+            -- that one is the same ZO_Options_Divider template created directly, without going
+            -- through this LAM widget wrapper, which defaults alpha to 0.25 (see
+            -- controls/divider.lua's DEFAULT_ALPHA) and looked noticeably fainter as a result.
+            type = "divider",
+            width = "full",
+            alpha = 1,
+        },
+        [4] = {
             -- The weekly table itself, drawn directly on the settings page. See
             -- controls/custom.lua in LibAddonMenu-2.0 for what this widget type provides.
             type = "custom",

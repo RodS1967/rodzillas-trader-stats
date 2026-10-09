@@ -58,44 +58,88 @@ local WEEK_SECONDS = 7 * 86400
 local TABLE_MAX_ROWS = 14
 local TABLE_ROW_TOP = 70
 local TABLE_ROW_HEIGHT = 24
-local TABLE_CONTENT_WIDTH = 680 -- status text, and both progress bar controls, share this width
 local TABLE_ROWS_BOTTOM = TABLE_ROW_TOP + TABLE_MAX_ROWS * TABLE_ROW_HEIGHT
 local STATS_CONTROL_HEIGHT = 500
+-- Left/right padding for everything in this block (table columns, status text, progress
+-- bar). The panel's real content width was unknown all day (two guesses, 740 then 710,
+-- were both too wide) until actually measured in-game 2026-10-09: parent:GetWidth() = 585.
+-- Left margin set to 0 (2026-10-09) to line up flush with "Guild" above, which LAM anchors
+-- at zero padding -- see RegisterAddonMenu's dropdown comment for why these two don't share
+-- a layout system and can't just inherit each other's padding automatically.
+local MEASURED_PANEL_WIDTH = 585 -- RZTS.statsParent:GetWidth(), confirmed in-game 2026-10-09
+local TABLE_LEFT_MARGIN = 0
+-- Right margin dropped to 0 2026-10-09 -- there was visible spare room even with "kiosk"
+-- widened once already. Worth watching for: a scrollbar has shown up at this same right
+-- edge in earlier screenshots, and it's not confirmed whether MEASURED_PANEL_WIDTH already
+-- accounts for its space or not.
+local TABLE_RIGHT_MARGIN = 0
+local TABLE_CONTENT_WIDTH = MEASURED_PANEL_WIDTH - TABLE_LEFT_MARGIN - TABLE_RIGHT_MARGIN
+
+-- No x values -- positions are computed left-to-right below (ComputeColumnPositions), each
+-- column starting exactly where the previous one ends. A previous version anchored the
+-- right-aligned columns backward from the panel's right edge independently of these --
+-- two separate calculations that could (and did) disagree, overlapping columns when the
+-- real panel width was narrower than assumed. Pure left-to-right can't overlap by
+-- construction: at worst, if the row is wider than the panel, only the last column runs
+-- off the edge, same as the original bug, never into another column's space.
+-- "kiosk" is deliberately the column allowed to clip (ellipsis) if a trader name is long --
+-- date/sales/gold/tax are the actual numbers this addon exists to show and must stay whole.
+-- Total here (520) plus 4 gaps (48) = 568, under the 585 available with both margins at 0 --
+-- "kiosk" widened again 2026-10-09 (150 -> 190) now that the right margin is also gone,
+-- keeping the same ~17px buffer after two earlier rounds of too-tight guesses.
 local TABLE_COLUMNS = {
-    { key = "date",  x = 40,  width = 120, align = TEXT_ALIGN_LEFT },
-    { key = "kiosk", x = 170, width = 230, align = TEXT_ALIGN_LEFT },
-    { key = "sales", x = 410, width = 70,  align = TEXT_ALIGN_RIGHT },
-    { key = "gold",  x = 490, width = 130, align = TEXT_ALIGN_RIGHT },
-    { key = "tax",   x = 630, width = 110, align = TEXT_ALIGN_RIGHT },
+    { key = "date",  width = 85,  align = TEXT_ALIGN_LEFT },
+    { key = "kiosk", width = 190, align = TEXT_ALIGN_LEFT },
+    { key = "sales", width = 45,  align = TEXT_ALIGN_RIGHT },
+    { key = "gold",  width = 105, align = TEXT_ALIGN_RIGHT },
+    { key = "tax",   width = 95,  align = TEXT_ALIGN_RIGHT },
 }
 local TABLE_HEADERS = { date = "Date Range", kiosk = "Kiosk", sales = "Sales", gold = "Sales Total", tax = "Tax Total" }
+local TABLE_COLUMN_GAP = 12
+
+local function ComputeColumnPositions()
+    local positions = {}
+    local x = TABLE_LEFT_MARGIN -- matches the status text/progress bar's left edge below
+    for _, column in ipairs(TABLE_COLUMNS) do
+        positions[column.key] = x
+        x = x + column.width + TABLE_COLUMN_GAP
+    end
+    return positions
+end
 
 local function FormatGold(amount)
     local digits = tostring(math.floor(amount)):reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
     return digits .. "g"
 end
 
-local function CreateTableCell(parent, column, y, font)
+local function CreateTableCell(parent, column, x, y, font)
     local label = WINDOW_MANAGER:CreateControl(nil, parent, CT_LABEL)
     label:SetFont(font)
     label:SetWidth(column.width)
     label:SetHorizontalAlignment(column.align)
-    label:SetAnchor(TOPLEFT, parent, TOPLEFT, column.x, y)
+    -- Ellipsis mode alone still wraps to multiple lines before it starts truncating --
+    -- confirmed 2026-10-09, a long kiosk name wrapped to 2 lines and collided with the row
+    -- below instead of truncating. MaxLineCount(1) forces truncation on the first line.
+    label:SetWrapMode(TEXT_WRAP_MODE_ELLIPSIS)
+    label:SetMaxLineCount(1)
+    label:SetAnchor(TOPLEFT, parent, TOPLEFT, x, y)
     label:SetText("")
     return label
 end
 
 function RZTS.EnsureTableControls(parent)
     if RZTS.tableLabels then return end
+    local columnX = ComputeColumnPositions()
     local tableLabels = { rows = {} }
     for _, column in ipairs(TABLE_COLUMNS) do
-        local header = CreateTableCell(parent, column, TABLE_ROW_TOP - 28, "ZoFontWinH5")
+        local header = CreateTableCell(parent, column, columnX[column.key], TABLE_ROW_TOP - 28, "ZoFontWinH5")
         header:SetText(TABLE_HEADERS[column.key])
     end
     for r = 1, TABLE_MAX_ROWS do
         local cells = {}
         for _, column in ipairs(TABLE_COLUMNS) do
-            cells[column.key] = CreateTableCell(parent, column, TABLE_ROW_TOP + (r - 1) * TABLE_ROW_HEIGHT, "ZoFontGame")
+            cells[column.key] =
+                CreateTableCell(parent, column, columnX[column.key], TABLE_ROW_TOP + (r - 1) * TABLE_ROW_HEIGHT, "ZoFontGame")
         end
         tableLabels.rows[r] = cells
     end
@@ -110,7 +154,7 @@ function RZTS.EnsureTableControls(parent)
     tableLabels.status = WINDOW_MANAGER:CreateControl(nil, parent, CT_LABEL)
     tableLabels.status:SetFont("ZoFontGame")
     tableLabels.status:SetWidth(TABLE_CONTENT_WIDTH)
-    tableLabels.status:SetAnchor(TOPLEFT, parent, TOPLEFT, 40, TABLE_ROWS_BOTTOM + 10)
+    tableLabels.status:SetAnchor(TOPLEFT, parent, TOPLEFT, TABLE_LEFT_MARGIN, TABLE_ROWS_BOTTOM + 10)
 
     -- Progress bar: a determinate fill while draining already-cached events (a known count,
     -- via GetPendingEventMetrics), or a slow blink while waiting on the server (no known size,
@@ -119,7 +163,7 @@ function RZTS.EnsureTableControls(parent)
     -- some of the status messages run long enough to wrap, and the bar must sit below both.
     tableLabels.progressTrack = WINDOW_MANAGER:CreateControl(nil, parent, CT_BACKDROP)
     tableLabels.progressTrack:SetDimensions(TABLE_CONTENT_WIDTH, 14)
-    tableLabels.progressTrack:SetAnchor(TOPLEFT, parent, TOPLEFT, 40, TABLE_ROWS_BOTTOM + 60)
+    tableLabels.progressTrack:SetAnchor(TOPLEFT, parent, TOPLEFT, TABLE_LEFT_MARGIN, TABLE_ROWS_BOTTOM + 60)
     tableLabels.progressTrack:SetCenterColor(0.15, 0.15, 0.15, 0.9)
     tableLabels.progressTrack:SetHidden(true)
     tableLabels.progressFill = WINDOW_MANAGER:CreateControl(nil, parent, CT_BACKDROP)

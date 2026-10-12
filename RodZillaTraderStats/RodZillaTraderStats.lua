@@ -777,6 +777,37 @@ local function BuildConsoleStatsOptions(optionsTable, startIndex)
     AddSellerSection("Top Sellers - Overall", GetOverallTopSellers)
 end
 
+-- PROTOTYPE 2026-10-12: proves console can push a dialog from inside the Settings > Add-Ons
+-- panel and return to it cleanly -- the one unverified technical risk behind the planned
+-- console redesign (see memory/eso-console-port-blockers, workboard issue #5). Modeled
+-- directly on LibAddonMenu-2.0's own GetConfirmDialog/ShowConfirmationDialog (same
+-- ESO_Dialogs[name] = {...} + ZO_Dialogs_ShowDialog(name) pattern, confirmed by reading its
+-- source rather than guessed) since that's the one locally-proven example of an addon doing
+-- exactly this from a settings-panel button callback. Static placeholder text only -- once
+-- this is confirmed working on real hardware, the next step is real scrollable content.
+local RZTS_CONSOLE_LOAD_DIALOG = "RZTS_CONSOLE_LOAD_DIALOG"
+
+local function GetConsoleLoadDialog()
+    if not ESO_Dialogs[RZTS_CONSOLE_LOAD_DIALOG] then
+        ESO_Dialogs[RZTS_CONSOLE_LOAD_DIALOG] = {
+            canQueue = true,
+            title = { text = "RodZilla's Trader Stats" },
+            mainText = { text = "" },
+            buttons = {
+                [1] = { text = "Close" },
+            },
+        }
+    end
+    return ESO_Dialogs[RZTS_CONSOLE_LOAD_DIALOG]
+end
+
+local function ShowConsoleLoadDialog()
+    local dialog = GetConsoleLoadDialog()
+    dialog.mainText.text = "Prototype: if you can read this and Close gets you back to the " ..
+        "settings panel with Guild and Load still working, the scene-push mechanism works."
+    ZO_Dialogs_ShowDialog(RZTS_CONSOLE_LOAD_DIALOG)
+end
+
 -- LibAddonMenu-2.0 registration: gives us a "RodZilla's Trader Stats" entry under
 -- Settings -> Add-Ons, with the weekly table drawn directly on the page via a "custom" LAM
 -- widget on PC -- see controls/custom.lua in LibAddonMenu-2.0 -- rather than a separate
@@ -864,6 +895,37 @@ function RZTS.RegisterAddonMenu()
     -- header/description list on console -- see BuildConsoleStatsOptions and
     -- RegisterAddonMenu's comment above for why these can't share one implementation.
     if IsConsoleUI() then
+        -- PROTOTYPE 2026-10-12: console-only override of the shared Refresh button above --
+        -- the PC "else" branch below is untouched. "Load" still triggers the same scan
+        -- Refresh always did; it additionally opens the prototype dialog (see
+        -- ShowConsoleLoadDialog above) to test the scene-push/return mechanism. The flattened
+        -- list built by BuildConsoleStatsOptions below is left in place for now, unchanged --
+        -- isolating this test to one variable (does the dialog push/return work) rather than
+        -- also removing the existing inline content in the same step.
+        optionsTable[2].name = "Load"
+        optionsTable[2].tooltip = "Loads this guild's trader history and opens the stats screen."
+        optionsTable[2].func = function()
+            RZTS.ComputeTraderStats()
+            ShowConsoleLoadDialog()
+        end
+        -- FOUND 2026-10-12, real hardware: the shared `disabled` function above (disable
+        -- while scanning, re-enable on phase "done"/"error") relies on registerForRefresh's
+        -- "LAM-RefreshPanel" callback to get re-checked once a scan finishes -- confirmed by
+        -- reading LibAddonMenu-2.0.lua that this callback only wires into the keyboard-UI
+        -- control path (RequestRefreshIfNeeded), never into registerConsoleOptionControls /
+        -- convertLamOptionsToHasTable. LibHarvensAddonSettings's own allowRefresh only
+        -- re-checks disable state "when one of the settings is changed" -- i.e. only in
+        -- direct response to a HAS-tracked setting being interacted with again, never in
+        -- response to our own async Publish() firing later when the LibHistoire scan
+        -- actually completes in the background. Net effect on real hardware: Load disables
+        -- correctly when a scan starts, then never re-enables -- permanently stuck -- until
+        -- the guild dropdown is touched again. Very likely the same root cause behind
+        -- workboard issue #2 (data stuck at kiosk name): any dynamic console text has this
+        -- same refresh gap. Until the real redesign replaces this flattened-list/HAS
+        -- approach entirely (issue #5), just don't gate Load on scan phase on console --
+        -- the dialog itself can show whatever the current phase is when opened.
+        optionsTable[2].disabled = nil
+
         -- No separate top divider here (2026-10-09, fixed a real double-divider bug): the
         -- "header" widget type BuildConsoleStatsOptions uses for the guild name (and for both
         -- Top Sellers sections) already draws its own ZO_Options_Divider above itself -- see

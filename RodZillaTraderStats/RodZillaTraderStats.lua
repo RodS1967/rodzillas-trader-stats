@@ -1,6 +1,6 @@
 RodZillaTraderStats = {}
 RodZillaTraderStats.name = "RodZillaTraderStats"
-RodZillaTraderStats.version = "0.1.7"
+RodZillaTraderStats.version = "0.1.8"
 
 local RZTS = RodZillaTraderStats
 
@@ -816,9 +816,13 @@ local function BuildConsoleLoadDialogText()
     return table.concat(sections, "\n\n")
 end
 
-local function ShowConsoleLoadDialog()
+-- overrideText lets the console Load button's error handler (see RegisterAddonMenu below)
+-- force specific content into the dialog without touching RZTS.traderStats -- that table is
+-- shared with PC's canvas, so writing an error string into it here would risk PC seeing it
+-- too the next time it renders.
+local function ShowConsoleLoadDialog(overrideText)
     local dialog = GetConsoleLoadDialog()
-    dialog.mainText.text = BuildConsoleLoadDialogText()
+    dialog.mainText.text = overrideText or BuildConsoleLoadDialogText()
     if IsInGamepadPreferredMode() then
         ZO_Dialogs_ShowGamepadDialog(RZTS_CONSOLE_LOAD_DIALOG)
     else
@@ -921,9 +925,29 @@ function RZTS.RegisterAddonMenu()
         -- the dialog built from real scan data (see BuildConsoleLoadDialogText above).
         optionsTable[2].name = "Load"
         optionsTable[2].tooltip = "Loads this guild's trader history and opens the stats screen."
+        -- Console-only safety net, found 2026-10-19: a Lua error surfacing here (e.g. from a
+        -- LibHistoire/base-game API call inside the shared ComputeTraderStats path) normally
+        -- shows as the game's own error popup -- confirmed capable of rendering BEHIND this
+        -- dialog on real hardware, unreadable (same dialog-layering issue already flagged for
+        -- LibHistoire's own shutdown-warning dialog). Catching it here and putting the message
+        -- straight into our own dialog's text guarantees it's actually readable, whatever it
+        -- turns out to be.
+        --
+        -- Deliberately scoped to ONLY this console branch's call site -- PC's Refresh button
+        -- above (same optionsTable[2], its original func) still calls RZTS.ComputeTraderStats()
+        -- completely unwrapped, so an error there behaves on PC exactly as it always has. This
+        -- only catches errors thrown synchronously during the button press itself (covers
+        -- IsTraderHistoryUpToDate's first, synchronous check) -- a later error thrown from an
+        -- async retry/callback after this call returns wouldn't be caught here either, since
+        -- that runs on its own separate call stack outside this pcall.
         optionsTable[2].func = function()
-            RZTS.ComputeTraderStats()
-            ShowConsoleLoadDialog()
+            local ok, err = pcall(function()
+                RZTS.ComputeTraderStats()
+                ShowConsoleLoadDialog()
+            end)
+            if not ok then
+                ShowConsoleLoadDialog("Something went wrong loading trader stats:\n\n" .. tostring(err))
+            end
         end
         -- FOUND 2026-10-12, real hardware: the shared `disabled` function above (disable
         -- while scanning, re-enable on phase "done"/"error") relies on registerForRefresh's
